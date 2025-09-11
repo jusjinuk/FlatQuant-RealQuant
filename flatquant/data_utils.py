@@ -93,6 +93,31 @@ def get_pile(nsamples, seed, seqlen, tokenizer):
         trainloader.append((inp, tar))
     return trainloader
 
+def get_redpajama(nsamples, seed, seqlen, tokenizer):
+    traindata = datasets.load_dataset("togethercomputer/RedPajama-Data-1T-Sample", split='train', trust_remote_code=True)['text']
+
+    #random.seed(seed)
+    selected_indices = set()
+    trainloader = []
+    while len(trainloader) < nsamples:
+        idx = random.randint(0, len(traindata) - 1)
+        if idx in selected_indices:
+            continue
+
+        text = traindata[idx]
+        ids = tokenizer(text, return_tensors="pt")["input_ids"][0]  # (T,)
+        if ids.shape[0] < seqlen:
+            continue
+
+        start = random.randint(0, ids.shape[0] - seqlen)
+        inp = ids[start:start + seqlen].unsqueeze(0)               # (1, S)
+        tar = inp.clone()
+        tar[:, :-1] = -100
+        selected_indices.add(idx)
+
+        trainloader.append((inp, tar)) 
+    return trainloader
+
 
 def get_loaders(
     args, name, nsamples=128, seed=0, seqlen=2048, model='', hf_token=None, eval_mode=False
@@ -110,6 +135,8 @@ def get_loaders(
         dataset = get_c4_new(nsamples, seed, seqlen, tokenizer, eval_mode)
     elif 'pile' in name:
         dataset = get_pile(nsamples, seed, seqlen, tokenizer)
+    elif 'redpajama' in name:
+        dataset = get_redpajama(nsamples, seed, seqlen, tokenizer)
 
     if 'c4' in name and eval_mode:
         dataset = dataset.input_ids

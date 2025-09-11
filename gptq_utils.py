@@ -308,3 +308,43 @@ def rtn_fwrd(model, dev, args):
             
     cleanup_memory(verbose=True)
     return quantizers
+
+
+@torch.no_grad()
+def _fwrd(model, dev, args):
+    '''
+    Quantize with learned scales & zero-points
+    '''
+    assert args.w_groupsize ==-1, "Groupsize not supported in RTN!"
+    layers = model.model.layers
+    torch.cuda.empty_cache()
+
+    quantizers = {}
+
+    for i in tqdm.tqdm(range(len(layers)), desc="(With scale Quant.) Layers"):
+        layer = layers[i].to(dev)
+        from flatquant.flat_linear import FlatQuantizedLinear
+        subset = find_qlayers(layer, layers=[FlatQuantizedLinear])
+
+        for name in subset:
+            layer_weight_bits = args.w_bits
+            if 'lm_head' in name:
+                layer_weight_bits = 16
+                continue
+            
+            quantizer = subset[name].weight_quantizer
+            quantizer.configure(
+                layer_weight_bits, perchannel=True, sym=not(args.w_asym), mse=args.gptq_mse
+            )
+
+            W = subset[name].learnable_weight.data
+            w_dtype = W.dtype
+            subset[name].learnable_weight.data = quantizer.quantize(W).to(w_dtype)
+            quantizers['model.layers.%d.%s.linear' % (i, name)] = quantizer.cpu()
+
+        layers[i] = layer.cpu()
+        torch.cuda.empty_cache()
+        del layer
+            
+    cleanup_memory(verbose=True)
+    return quantizers

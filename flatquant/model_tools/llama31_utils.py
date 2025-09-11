@@ -18,10 +18,14 @@ class FlatQuantLlamaMLP(LlamaMLP):
     def __init__(self, args, module: LlamaMLP):
         super().__init__(module.config)
         self.args = args
+        self.no_apply_trans = args.no_apply_trans
         self.up_proj = FlatQuantizedLinear(args, module.up_proj)
         self.gate_proj = FlatQuantizedLinear(args, module.gate_proj)
         self.down_proj = FlatQuantizedLinear(args, module.down_proj)
-        self.add_fq_trans()
+        if not self.no_apply_trans:
+            self.add_fq_trans()
+        else:
+            self.up_gate_trans, self.down_trans = None, None
 
         self._ori_mode = False
         self.diag_init = args.diag_init
@@ -90,6 +94,12 @@ class FlatQuantLlamaMLP(LlamaMLP):
             self.up_proj.linear.weight.data = up_weight.to(ori_dtype)
             self.down_trans.use_diag = False
 
+            if self.args.learn_scale and self.up_proj.weight_quantizer.learn_scale:
+                q = self.up_proj.weight_quantizer
+                s = self.down_trans.diag_scale.to(q.scale.dtype)
+                with torch.no_grad():
+                    q.scale.mul_(s.view(-1, *([1] * (q.scale.dim() - 1))))
+
     def init_diag_scale(self, alpha=0.5):
         assert hasattr(self, "up_smax") and hasattr(self, "down_smax")
         upw_smax = torch.cat([self.up_proj.linear.weight, self.gate_proj.linear.weight], dim=0).abs().max(dim=0)[0]
@@ -112,21 +122,27 @@ class FlatQuantLlamaAttention(LlamaAttention):
         super().__init__(module.config, module.layer_idx)
         self.args = args
         
+        self.no_apply_trans = args.no_apply_trans
         self.q_proj = FlatQuantizedLinear(args, module.q_proj)
         self.k_proj = FlatQuantizedLinear(args, module.k_proj)
         self.v_proj = FlatQuantizedLinear(args, module.v_proj)
         self.o_proj = FlatQuantizedLinear(args, module.o_proj)
-        self.add_fq_trans()
+        if not self.no_apply_trans:
+            self.add_fq_trans()
+        else:
+            self.ln_trans, self.o_trans = None, None
+            self.kcache_trans = None
+            self.vcache_trans = None
 
         if args.q_bits < 16:
             self.q_cache_quantizer = ActivationQuantizer(bits=args.q_bits, \
-                                        sym=not(args.q_asym), lac=args.lac, groupsize=-1, )
+                                        sym=not(args.q_asym), lac=args.lac, groupsize=-1)
         if args.k_bits < 16:
             self.k_cache_quantizer = ActivationQuantizer(bits=args.k_bits, \
-                                        sym=not(args.k_asym), lac=args.lac, groupsize=-1, )
+                                        sym=not(args.k_asym), lac=args.lac, groupsize=-1)
         if args.v_bits < 16:
             self.v_cache_quantizer = ActivationQuantizer(bits=args.v_bits, \
-                                        sym=not(args.v_asym), lac=args.lac, groupsize=-1, )
+                                        sym=not(args.v_asym), lac=args.lac, groupsize=-1)
 
         self._ori_mode = False
         self._eval_mode = False
@@ -263,9 +279,10 @@ class FlatQuantLlamaAttention(LlamaAttention):
                 attn_output = self.o_proj(attn_output)
             else:
                 init_shape = attn_output.shape
-                attn_output = attn_output.reshape(-1, self.config.num_attention_heads, self.config.hidden_size//self.config.num_attention_heads)
-                attn_output = torch.matmul(self.o_trans.get_matrix().T.to(attn_output), attn_output).reshape(init_shape)
-                if not self._eval_mode:
+                if self.o_trans is not None:
+                    attn_output = attn_output.reshape(-1, self.config.num_attention_heads, self.config.hidden_size//self.config.num_attention_heads)
+                    attn_output = torch.matmul(self.o_trans.get_matrix().T.to(attn_output), attn_output).reshape(init_shape)
+                if not self._eval_mode and not self.no_apply_trans:
                     attn_o_og_it = self.o_trans.get_matrix(inv_t=True)
                     attn_v_og_it = self.vcache_trans.get_matrix(inv_t=True)
                     attn_output = self.o_proj(attn_output, qa_trans=[attn_o_og_it, attn_v_og_it])
