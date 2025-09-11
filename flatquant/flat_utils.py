@@ -69,6 +69,13 @@ def save_flat_matrices(args, model, rank=None):
         layer.self_attn.rep_matrix_only()
         layer.mlp.rep_matrix_only()
         paras_name = ["trans.matrix", "trans.diag_scale", "clip_factor_w", "clip_factor_a"]
+        if args.learn_weight:
+            paras_name.append("learnable_weight")
+            paras_name.append("input_layernorm.weight")
+            paras_name.append("post_attention_layernorm.weight")
+        if args.learn_scale:
+            paras_name.append("scale")
+            paras_name.append("zero")
         flat_matrices[i] = get_paras_dict_by_name(layer, required_names=paras_name)
     if rank is not None:
         matrices_path = os.path.join(args.exp_dir, f"flat_matrices_{rank}.pth")
@@ -110,6 +117,9 @@ def save_quantized_weights_with_safetensors(args, model, quantizers, sym = True)
     for name, param in model.named_parameters():
         if name.endswith('.weight') or name.endswith('.bias'):
             layer_name = name.rsplit('.', 1)[0]
+        elif name.endswith('.learnable_weight'):
+            layer_name = name.rsplit('.', 1)[0] + '.linear'
+            name = name.rsplit('.', 1)[0] + '.linear.weight'
         else:
             layer_name = name
             
@@ -134,7 +144,8 @@ def save_quantized_weights_with_safetensors(args, model, quantizers, sym = True)
             state_dict[name] = pack_i4(param_quant_int8).contiguous()
 
         else:
-            state_dict[name] = param.to(torch.half).contiguous()
+            if not name.endswith('.scale') and not name.endswith('.zero') and not name.endswith('.maxq'):
+                state_dict[name] = param.to(torch.half).contiguous()
     
     for layer_name, quantizer in quantizers.items():
         state_dict[f"quantizer.{layer_name}.scale"] = quantizer.scale.contiguous()

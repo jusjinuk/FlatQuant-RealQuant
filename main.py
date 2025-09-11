@@ -41,10 +41,13 @@ def main():
 
     if args.w_bits < 16:
         save_dict = {}
-        if args.gptq: # GPTQ Weight Quantization
-            quantizers = gptq_utils.gptq_fwrd(model, trainloader, utils.DEV, args)
-        else: # RTN Weight Quantization
-            quantizers = gptq_utils.rtn_fwrd(model, utils.DEV, args)
+        if not args.learn_scale:
+            if args.gptq: # GPTQ Weight Quantization
+                quantizers = gptq_utils.gptq_fwrd(model, trainloader, utils.DEV, args)
+            else: # RTN Weight Quantization
+                quantizers = gptq_utils.rtn_fwrd(model, utils.DEV, args)
+        else:
+            quantizers = gptq_utils._fwrd(model, utils.DEV, args)
         save_dict["w_quantizers"] = quantizers
 
     ## save quantized weight

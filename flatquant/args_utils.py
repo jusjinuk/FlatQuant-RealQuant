@@ -18,6 +18,7 @@ supported_models = [
             './modelzoo/llama-3.1/llama-3.1-8b',
             './modelzoo/llama-3.1/llama-3.1-70b',
             './modelzoo/llama-3.1-instruct/llama-3.1-8b-instruct',
+            './modelzoo/llama-3.1-instruct/llama-3.1-70b-instruct',
             './modelzoo/llama-3.3-instruct/llama-3.3-70b-instruct',
             './modelzoo/llama-3-instruct/llama-3-8b-instruct',
             './modelzoo/llama-3-instruct/llama-3-8b-instruct',
@@ -36,7 +37,7 @@ supported_models = [
 #             'Qwen/Qwen2.5-32B-Instruct', 
 #             'Qwen/Qwen2.5-7B-Instruct', 
 #             ]
-supported_datasets = ['wikitext2', 'c4', 'pile']
+supported_datasets = ['wikitext2', 'c4', 'pile', 'redpajama']
 
 
 def parser_gen():
@@ -82,8 +83,12 @@ def parser_gen():
                         help='Number of calibration data samples for FlatQuant and GPTQ.')
     parser.add_argument('--cali_bsz', type=int, default=4,
                         help='Batch size for FlatQuant. Default is 4.')
+    parser.add_argument('--cali_bsz_accumulate_step', type=int, default=1,
+                        help='Accumulate steps for FlatQuant. Default is 1.')
     parser.add_argument("--flat_lr", type=float, default=1e-5, 
                         help='Learning rate for learnable transformation.')
+    parser.add_argument("--weight_lr", type=float, default=1e-5, 
+                        help='Learning rate for learnable weight.')
     parser.add_argument("--cali_trans", default=False, action="store_true", 
                         help="Enable calibration of transformations.")
     parser.add_argument("--add_diag", default=False, action="store_true", 
@@ -153,7 +158,25 @@ def parser_gen():
     # Add quantized_save flag
     parser.add_argument('--quantized_save', action = "store_true", default = False,
                         help = 'Save the quantized model checkpoint.')
-
+    
+    # Add block-wise QAT flag
+    parser.add_argument('--blockwise_qat', action = "store_true", default = False,
+                        help = 'Do Block-wise QAT, not FlatQuant')
+    
+    # Add offload flag
+    parser.add_argument('--offload', action = "store_true", default = False,
+                        help = 'Do offloading')
+        
+    # Add learnable scale flag
+    parser.add_argument('--learn_scale', action = "store_true", default = False,
+                        help = 'Train scales & zero points')
+    
+    parser.add_argument('--learn_weight', action = "store_true", default = False,
+                        help = 'Train weights directly')
+    
+    parser.add_argument('--no_apply_trans', action = "store_true", default = False,
+                        help = 'Apply kronecker transform matrix')
+    
     args = parser.parse_args()
     if args.a_groupsize > -1:
         raise NotImplementedError

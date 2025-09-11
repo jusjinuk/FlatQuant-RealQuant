@@ -76,6 +76,8 @@ def get_opt(model_name):
 def get_model(model_name, hf_token=None):
     if 'llama-3.1' in model_name.lower():
         return get_llama_31(model_name, hf_token)
+    elif 'llama-3.3' in model_name.lower():
+        return get_llama_31(model_name, hf_token)
     elif 'llama' in model_name:
         return get_llama(model_name, hf_token)
     elif 'qwen-2.5' in model_name:

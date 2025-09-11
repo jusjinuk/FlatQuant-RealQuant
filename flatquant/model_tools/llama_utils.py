@@ -20,10 +20,14 @@ class FlatQuantLlamaMLP(LlamaMLP):
     def __init__(self, args, module: LlamaMLP):
         super().__init__(module.config)
         self.args = args
+        self.no_apply_trans = args.no_apply_trans
         self.up_proj = FlatQuantizedLinear(args, module.up_proj)
         self.gate_proj = FlatQuantizedLinear(args, module.gate_proj)
         self.down_proj = FlatQuantizedLinear(args, module.down_proj)
-        self.add_fq_trans()
+        if not self.no_apply_trans:
+            self.add_fq_trans()
+        else:
+            self.up_gate_trans, self.down_trans = None, None
 
         self._ori_mode = False
         self.diag_init = args.diag_init
@@ -114,11 +118,17 @@ class FlatQuantLlamaAttention(LlamaAttention):
         super().__init__(module.config, module.layer_idx)
         self.args = args
         
+        self.no_apply_trans = args.no_apply_trans
         self.q_proj = FlatQuantizedLinear(args, module.q_proj)
         self.k_proj = FlatQuantizedLinear(args, module.k_proj)
         self.v_proj = FlatQuantizedLinear(args, module.v_proj)
         self.o_proj = FlatQuantizedLinear(args, module.o_proj)
-        self.add_fq_trans()
+        if not self.no_apply_trans:
+            self.add_fq_trans()
+        else:
+            self.ln_trans, self.o_trans = None, None
+            self.kcache_trans = None
+            self.vcache_trans = None
 
         if args.q_bits < 16:
             self.q_cache_quantizer = ActivationQuantizer(bits=args.q_bits, \
@@ -273,9 +283,10 @@ class FlatQuantLlamaAttention(LlamaAttention):
                 attn_output = self.o_proj(attn_output)
             else:
                 init_shape = attn_output.shape
-                attn_output = attn_output.reshape(-1, self.config.num_attention_heads, self.config.hidden_size//self.config.num_attention_heads)
-                attn_output = torch.matmul(self.o_trans.get_matrix().T.to(attn_output), attn_output).reshape(init_shape)
-                if not self._eval_mode:
+                if self.o_trans is not None:
+                    attn_output = attn_output.reshape(-1, self.config.num_attention_heads, self.config.hidden_size//self.config.num_attention_heads)
+                    attn_output = torch.matmul(self.o_trans.get_matrix().T.to(attn_output), attn_output).reshape(init_shape)
+                if not self._eval_mode and not self.no_apply_trans:
                     attn_o_og_it = self.o_trans.get_matrix(inv_t=True)
                     attn_v_og_it = self.vcache_trans.get_matrix(inv_t=True)
                     attn_output = self.o_proj(attn_output, qa_trans=[attn_o_og_it, attn_v_og_it])

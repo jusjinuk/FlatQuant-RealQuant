@@ -6,6 +6,8 @@ def round_ste(x: torch.Tensor):
     """
     return (x.round() - x).detach() + x
 
+def clamp_ste(x: torch.Tensor, min, max):
+    return (x.clamp(min,max) - x).detach() + x
 
 def get_qmin_qmax(bits, sym):
     if sym:
@@ -19,6 +21,9 @@ def get_qmin_qmax(bits, sym):
 def sym_quant(x, scale, maxq):
     scale = scale.to(x.device)
     q = torch.clamp(round_ste(x / scale), -(maxq + 1), maxq)
+    if torch.isinf(q).any():
+        print("inf!")
+        import pdb; pdb.set_trace()
     return q, scale
 
 
@@ -111,6 +116,7 @@ class ActivationQuantizer(torch.nn.Module):
             xmin[tmp] = -1
             xmax[tmp] = +1
             scale = (xmax - xmin) / q_max
+            scale = torch.clamp(scale, min=1e-5)
             zero = torch.round(-xmin / scale)
 
             scale = scale.repeat(1, reshaped_x.shape[-1]).reshape(init_shape)
@@ -122,11 +128,13 @@ class ActivationQuantizer(torch.nn.Module):
 class WeightQuantizer(torch.nn.Module):
     '''From GPTQ Repo'''
 
-    def __init__(self, shape=1):
+    def __init__(self, shape=1, learn_scale = False):
         super(WeightQuantizer, self).__init__()
-        self.register_buffer('maxq', torch.tensor(0))
-        self.register_buffer('scale', torch.zeros(shape))
-        self.register_buffer('zero', torch.zeros(shape))
+        self.learn_scale = learn_scale
+        if not self.learn_scale:
+            self.register_buffer('maxq', torch.tensor(0))
+            self.register_buffer('scale', torch.zeros(shape))
+            self.register_buffer('zero', torch.zeros(shape))
 
         self.enable = True
 
@@ -142,10 +150,56 @@ class WeightQuantizer(torch.nn.Module):
         self.norm = norm
         self.grid = grid
         self.maxshrink = maxshrink
-        if sym:
-            self.maxq = torch.tensor(2**(bits-1)-1)
+        
+        val = (2**(bits-1) - 1) if sym else (2**bits - 1)
+
+        if hasattr(self, "maxq") and isinstance(self.maxq, torch.Tensor):
+            with torch.no_grad():
+                self.maxq.data = torch.as_tensor(val, dtype=self.maxq.dtype, device=self.maxq.device)
         else:
-            self.maxq = torch.tensor(2**bits - 1)
+            self.maxq = torch.tensor(val)
+
+    def _init_scale_zero(self, x):
+        if self.bits == 16 or (not self.enable):
+            return
+        dev = x.device
+        self.maxq = self.maxq.to(dev)
+
+        shape = x.shape
+        if self.perchannel:
+            x = x.flatten(1)
+        else:
+            x = x.flatten().unsqueeze(0)
+
+        tmp = torch.zeros(x.shape[0], device=dev)
+        xmin = torch.minimum(x.min(1)[0], tmp)
+        xmax = torch.maximum(x.max(1)[0], tmp)
+
+        if self.sym:
+            xmax = torch.maximum(torch.abs(xmin), xmax).clamp(min=1e-5)
+            self.scale = xmax / self.maxq
+            self.zero = torch.zeros_like(self.scale)
+        else:
+            tmp = (xmin == 0) & (xmax == 0)
+            xmin[tmp] = -1
+            xmax[tmp] = +1
+            self.scale = (xmax - xmin).clamp(min=1e-5) / self.maxq
+            self.zero = torch.round(-xmin / self.scale)
+
+        if not self.perchannel:
+
+            tmp = shape[0]
+            self.scale = self.scale.repeat(tmp)
+            self.zero = self.zero.repeat(tmp)
+
+        shape = [-1] + [1] * (len(shape) - 1)
+        self.scale = self.scale.reshape(shape)
+        self.zero = self.zero.reshape(shape)
+
+        self.scale = torch.nn.Parameter(self.scale, requires_grad=True)
+        self.zero = torch.nn.Parameter(self.zero.round(), requires_grad=True)
+        self.maxq = torch.nn.Parameter(self.maxq, requires_grad=False)
+        
 
     def find_params(self, x):
         if self.bits == 16 or (not self.enable):
@@ -214,9 +268,10 @@ class WeightQuantizer(torch.nn.Module):
     def quantize(self, x):
         x_dtype = x.dtype
         if self.enable and self.ready() and self.bits < 16:
+            scale = clamp_ste(self.scale, 1e-4, 1e4)
             if self.sym:
-                return sym_quant_dequant(x, self.scale, self.maxq).to(x_dtype)
-            return asym_quant_dequant(x, self.scale, self.zero, self.maxq).to(x_dtype)
+                return sym_quant_dequant(x, scale, self.maxq).to(x_dtype)
+            return asym_quant_dequant(x, scale, self.zero, self.maxq).to(x_dtype)
         return x
     
     def forward(self, x):
