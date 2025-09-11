@@ -16,3 +16,7 @@ log_*.txt
 *.pth
 modelzoo/*
 outputs/*
+*lr_swip
+slurm*
+outputs*
+ablation
