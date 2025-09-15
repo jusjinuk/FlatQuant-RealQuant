@@ -342,6 +342,23 @@ def _fwrd(model, dev, args):
             subset[name].learnable_weight.data = quantizer.quantize(W).to(w_dtype)
             quantizers['model.layers.%d.%s.linear' % (i, name)] = quantizer.cpu()
 
+        extra = find_qlayers(layer, layers=[torch.nn.Linear])
+        for name, mod in extra.items():
+            if not (".o_trans.linear" in name or ".kcache_trans.linear" in name or ".vcache_trans.linear" in name):
+                continue
+            layer_weight_bits = args.w_bits
+            if 'lm_head' in name:
+                continue
+            quantizer = WeightQuantizer()
+            quantizer.configure(
+                layer_weight_bits, perchannel=True, sym=not(args.w_asym), mse=args.gptq_mse
+            )
+            W = mod.weight.data
+            w_dtype = W.dtype
+            quantizer.find_params(W)
+            mod.weight.data = quantizer.quantize(W).to(w_dtype)
+            quantizers[f'model.layers.{i}.{name}'] = quantizer.cpu()
+            
         layers[i] = layer.cpu()
         torch.cuda.empty_cache()
         del layer

@@ -156,3 +156,45 @@ python ./benchmarks/benchmark_lm_eval.py --lm_eval_batch_size 16
 - Attention during the prefill uses unquantized query/keys as they are available during the prefill.
 - Implemented **learned activation clipping** for FlatQuant kernels.
 - ⚠️ Currently, only models with a `hidden_dim` that is a power of 2 are supported because of triton kernel implementation.
+
+## How to learn Block-wise QAT
+
+- Block-wise QAT
+    ```bash
+    # W4A4KV4
+    python ./main.py \
+        --model ./modelzoo/llama-3.1-instruct/llama-3.1-8b-instruct \
+        --w_bits 4 --a_bits 4 \
+        --k_bits 4 --k_asym --k_groupsize 128 \
+        --v_bits 4 --v_asym --v_groupsize 128 \
+        --cali_bsz 2 --cali_bsz_accumulate_step 2 --epoch 15 --flat_lr 5e-3 \
+        --lwc --lac --cali_trans --add_diag \
+        --output_dir ./outputs --save_matrix \
+        --lm_eval --lm_eval_batch_size 16 \
+        --quantized_save \
+        --offload \
+        --learn_weight --learn_scale \
+        --weight_lr 1e-5 \
+        --cali_dataset redpajama \
+        --nsamples 128
+    ```
+
+- Block-wise QAT (scale-up version)
+    ```bash
+    # W4A4KV4
+    python ./main.py \
+        --model ./modelzoo/llama-3.1-instruct/llama-3.1-8b-instruct \
+        --w_bits 4 --a_bits 4 \
+        --k_bits 4 --k_asym --k_groupsize 128 \
+        --v_bits 4 --v_asym --v_groupsize 128 \
+        --cali_bsz 2 --cali_bsz_accumulate_step 2 --epoch 4 --flat_lr 5e-3 \
+        --lwc --lac --cali_trans --add_diag \
+        --output_dir ./outputs --save_matrix \
+        --lm_eval --lm_eval_batch_size 16 \
+        --quantized_save \
+        --offload \
+        --learn_weight --learn_scale \
+        --weight_lr 1e-5 \
+        --cali_dataset redpajama \
+        --nsamples 4096
+    ```
