@@ -89,6 +89,8 @@ def parser_gen():
                         help='Learning rate for learnable transformation.')
     parser.add_argument("--weight_lr", type=float, default=1e-5, 
                         help='Learning rate for learnable weight.')
+    parser.add_argument("--scale_lr", type=float, default=1e-4, 
+                        help='Learning rate for learnable scale.')
     parser.add_argument("--cali_trans", default=False, action="store_true", 
                         help="Enable calibration of transformations.")
     parser.add_argument("--add_diag", default=False, action="store_true", 

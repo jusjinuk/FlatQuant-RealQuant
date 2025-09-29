@@ -162,43 +162,63 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
         layer = layer.to(dev)
         set_require_grad_all(layer, False)
         trained_params, paras_name = [], []
+        flat_param, clip_param, weight_param, scale_param = [], [], [], []
         if args.cali_trans:
-            trained_params.append({"params": get_n_set_parameters_byname(layer, ["trans.linear", ]), "lr": args.flat_lr})
+            trained_params.append({"params": get_n_set_parameters_byname(layer, ["trans.linear", ]), "lr": args.flat_lr, "tag": "trans.linear"})
             paras_name.append("trans.linear")
+            flat_param.append("trans.linear")
         if args.add_diag:
-            trained_params.append({"params": get_n_set_parameters_byname(layer, ["trans.diag_scale", ]), "lr": args.flat_lr})
+            trained_params.append({"params": get_n_set_parameters_byname(layer, ["trans.diag_scale", ]), "lr": args.flat_lr, "tag": "trans.diag_scale"})
             paras_name.append("trans.diag_scale")
+            flat_param.append("trans.diag_scale")
         if args.lwc:
-            trained_params.append({"params": get_n_set_parameters_byname(layer, ["clip_factor_w", ]), "lr": args.flat_lr * 10})
+            trained_params.append({"params": get_n_set_parameters_byname(layer, ["clip_factor_w", ]), "lr": args.flat_lr * 10, "tag": "clip_factor_w"})
             paras_name.append("clip_factor_w")
+            clip_param.append("clip_factor_w")
         if args.lac:
-            trained_params.append({"params": get_n_set_parameters_byname(layer, ["clip_factor_a", ]), "lr": args.flat_lr * 10})
+            trained_params.append({"params": get_n_set_parameters_byname(layer, ["clip_factor_a", ]), "lr": args.flat_lr * 10, "tag": "clip_factor_a"})
             paras_name.append("clip_factor_a")
+            clip_param.append("clip_factor_a")
 
         if args.learn_weight:
-            trained_params.append({"params": get_n_set_parameters_byname(layer, ["learnable_weight", ]), "lr": args.weight_lr})
+            trained_params.append({"params": get_n_set_parameters_byname(layer, ["learnable_weight", ]), "lr": args.weight_lr, "tag": "weight"})
             paras_name.append("weight")
+            weight_param.append("weight")
 
-            trained_params.append({"params": get_n_set_parameters_byname(layer, ["input_layernorm.weight", ]), "lr": args.weight_lr })
+            trained_params.append({"params": get_n_set_parameters_byname(layer, ["input_layernorm.weight", ]), "lr": args.weight_lr, "tag": "input_layernorm"})
             paras_name.append("input_layernorm")
+            weight_param.append("input_layernorm")
             
-            trained_params.append({"params": get_n_set_parameters_byname(layer, ["post_attention_layernorm.weight", ]), "lr": args.weight_lr })
+            trained_params.append({"params": get_n_set_parameters_byname(layer, ["post_attention_layernorm.weight", ]), "lr": args.weight_lr, "tag": "post_attention_layernorm"})
             paras_name.append("post_attention_layernorm")
+            weight_param.append("post_attention_layernorm")
 
         if args.learn_scale:
-            trained_params.append({"params": get_n_set_parameters_byname(layer, [".scale", ]), "lr": args.weight_lr * 10})
+            trained_params.append({"params": get_n_set_parameters_byname(layer, [".scale", ]), "lr": args.scale_lr, "tag": "scale"})
             paras_name.append("scale")
+            scale_param.append("scale")
 
             if args.w_asym:
-                trained_params.append({"params": get_n_set_parameters_byname(layer, [".zero", ]), "lr": args.weight_lr * 10})
+                trained_params.append({"params": get_n_set_parameters_byname(layer, [".zero", ]), "lr": args.scale_lr, "tag": "zero"})
                 paras_name.append("zero")
+                scale_param.append("zero")
 
         accumulate_steps = args.cali_bsz_accumulate_step
         optimizer = torch.optim.AdamW(trained_params)
-        scheduler_main = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs * (args.nsamples // (args.cali_bsz * accumulate_steps)), eta_min=args.flat_lr * 1e-3)
+        empty_optimizer_1 = torch.optim.AdamW([torch.tensor(0)], lr=args.flat_lr)
+        empty_optimizer_0 = torch.optim.AdamW([torch.tensor(0)], lr=args.flat_lr * 10)
+        empty_optimizer_2 = torch.optim.AdamW([torch.tensor(0)], lr=args.weight_lr)
+        empty_optimizer_3 = torch.optim.AdamW([torch.tensor(0)], lr=args.scale_lr)
+        group_idx = { g.get("tag", f"group{i}"): i for i, g in enumerate(optimizer.param_groups) }
+        scheduler_main = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_1, T_max=args.epochs * (args.nsamples // (args.cali_bsz * accumulate_steps)), eta_min=args.flat_lr * 1e-3)
+        scheduler_clip = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_0, T_max=args.epochs * (args.nsamples // (args.cali_bsz * accumulate_steps)), eta_min=args.flat_lr * 1e-3)
+        scheduler_weight = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_2, T_max=args.epochs * (args.nsamples // (args.cali_bsz * accumulate_steps)), eta_min=args.weight_lr / 20)
+        scheduler_scale = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_3, T_max=args.epochs * (args.nsamples // (args.cali_bsz * accumulate_steps)), eta_min=args.scale_lr / 20)
         if args.warmup:
-            scheduler_warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=16)
+            scheduler_warmup = torch.optim.lr_scheduler.LinearLR(empty_optimizer_1, start_factor=0.01, total_iters=16)
             scheduler = torch.optim.lr_scheduler.ChainedScheduler([scheduler_warmup, scheduler_main])
+            scheduler_warmup_2 = torch.optim.lr_scheduler.LinearLR(empty_optimizer_1, start_factor=0.01, total_iters=16)
+            scheduler_clip = torch.optim.lr_scheduler.ChainedScheduler([scheduler_warmup_2, scheduler_clip])
         else:
             scheduler = scheduler_main
         # check_params_grad(layer)
@@ -246,6 +266,17 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
                         optimizer.step()
                         if scheduler is not None: 
                             scheduler.step()
+                            scheduler_clip.step()
+                            scheduler_weight.step()
+                            scheduler_scale.step()
+                            for tag in flat_param:
+                                optimizer.param_groups[group_idx[tag]]['lr'] = scheduler.get_last_lr()[0]
+                            for tag in clip_param:
+                                optimizer.param_groups[group_idx[tag]]['lr'] = scheduler_clip.get_last_lr()[0]
+                            for tag in weight_param:
+                                optimizer.param_groups[group_idx[tag]]['lr'] = scheduler_weight.get_last_lr()[0]
+                            for tag in scale_param:
+                                optimizer.param_groups[group_idx[tag]]['lr'] = scheduler_scale.get_last_lr()[0]
                         optimizer.zero_grad()
                     iter += 1
 
@@ -257,13 +288,21 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
                     logger.info(f"[MEM] layer {i} epoch {epoch} peak_alloc={_bytes_to_mb(peak_alloc):.1f}MB "
                                 f"peak_resvd={_bytes_to_mb(peak_resvd):.1f}MB")
             cur_flat_lr = optimizer.state_dict()['param_groups'][0]['lr']
+            if args.learn_weight:
+                cur_weight_lr = optimizer.state_dict()['param_groups'][group_idx["weight"]]['lr']
             if args.learn_scale:
-                cur_weight_lr = optimizer.state_dict()['param_groups'][-1]['lr']
+                cur_scale_lr = optimizer.state_dict()['param_groups'][group_idx["scale"]]['lr']
             
-            if args.learn_scale:
-                logger.info(f"layer {i} lwc lac iter {epoch}, flat_lr {cur_flat_lr:.8f}  weight_lr {cur_weight_lr:.8f}  time {time.time() - start_tick:.6f}s, mse: {mse / accumulate_steps:.8f}, mean_mse: {mse / iter :.8f}" )
+            if args.learn_weight:
+                if args.learn_scale:
+                    logger.info(f"layer {i} lwc lac iter {epoch}, flat_lr {cur_flat_lr:.8f}, weight_lr {cur_weight_lr:.8f}, scale_lr {cur_scale_lr:.8f}, time {time.time() - start_tick:.6f}s, mse: {mse / accumulate_steps:.8f}, mean_mse: {mse / iter :.8f}" )
+                else:
+                    logger.info(f"layer {i} lwc lac iter {epoch}, flat_lr {cur_flat_lr:.8f}, weight_lr {cur_weight_lr:.8f}, time {time.time() - start_tick:.6f}s, mse: {mse / accumulate_steps:.8f}, mean_mse: {mse / iter :.8f}" )
             else:
-                logger.info(f"layer {i} lwc lac iter {epoch}, flat_lr {cur_flat_lr:.8f}  time {time.time() - start_tick:.6f}s, mse: {mse / accumulate_steps:.8f}, mean_mse: {mse / iter :.8f}" )
+                if args.learn_scale:
+                    logger.info(f"layer {i} lwc lac iter {epoch}, flat_lr {cur_flat_lr:.8f}, scale_lr {cur_scale_lr:.8f}, time {time.time() - start_tick:.6f}s, mse: {mse / accumulate_steps:.8f}, mean_mse: {mse / iter :.8f}" )
+                else:
+                    logger.info(f"layer {i} lwc lac iter {epoch}, flat_lr {cur_flat_lr:.8f}, time {time.time() - start_tick:.6f}s, mse: {mse / accumulate_steps:.8f}, mean_mse: {mse / iter :.8f}" )
 
         fp_inps, fp_outs = fp_outs, fp_inps
         layers[i] = layer.to(dtype=torch.float16, device="cpu")
