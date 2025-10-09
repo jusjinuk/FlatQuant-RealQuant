@@ -11,7 +11,15 @@ import gptq_utils
 
 def main():
     args, logger = args_utils.parser_gen()
-    utils.seed_everything(seed=args.seed)
+    dist_env = utils.init_distributed(args)
+    if dist_env is not None:
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+        logger = args_utils.create_logger(args.exp_dir, dist_rank=dist_env.rank)
+    utils.seed_everything(seed=args.seed + (dist_env.rank if dist_env is not None else 0))
+
+    device = dist_env.device if dist_env is not None else utils.DEV
+    rank_zero = dist_env is None or dist_env.rank == 0
 
     model, apply_flatquant_to_model = model_utils.get_model(args.model, args.hf_token)
     model.eval()
@@ -23,59 +31,62 @@ def main():
         seed=args.seed, model=args.model,
         seqlen=model.seqlen, eval_mode=False
     )
-    logger.info("Finished loading training data.")
+    if rank_zero:
+        logger.info("Finished loading training data.")
 
     if args.quantize:
         model = apply_flatquant_to_model(args, model)
-        logger.info("Finished applying FlatQuant to model.")
+        if rank_zero:
+            logger.info("Finished applying FlatQuant to model.")
         if args.resume:
             flat_utils.load_flat_parameters(args, model)
         elif args.reload_matrix:
             flat_utils.load_flat_matrices(args, model, path=args.matrix_path)
         elif (args.cali_trans or args.add_diag or args.lwc or args.lac):
-            train_utils.cali_flat_quant(args, model, trainloader, utils.DEV, logger=logger)
-        if args.save_matrix and not args.reload_matrix:
+            train_utils.cali_flat_quant(args, model, trainloader, device, logger=logger, dist_env=dist_env)
+        if args.save_matrix and not args.reload_matrix and rank_zero:
             flat_utils.save_flat_matrices(args, model)
         flat_utils.reparameterize_model(model)
-        logger.info("Finished reparameterize model.")
+        if rank_zero:
+            logger.info("Finished reparameterize model.")
 
-    if args.w_bits < 16:
+    if args.w_bits < 16 and rank_zero:
         save_dict = {}
         if not args.learn_scale:
             if args.gptq: # GPTQ Weight Quantization
-                quantizers = gptq_utils.gptq_fwrd(model, trainloader, utils.DEV, args)
+                quantizers = gptq_utils.gptq_fwrd(model, trainloader, device, args)
             else: # RTN Weight Quantization
-                quantizers = gptq_utils.rtn_fwrd(model, utils.DEV, args)
+                quantizers = gptq_utils.rtn_fwrd(model, device, args)
         else:
-            quantizers = gptq_utils._fwrd(model, utils.DEV, args)
+            quantizers = gptq_utils._fwrd(model, device, args)
         save_dict["w_quantizers"] = quantizers
 
     ## save quantized weight
-    if args.quantized_save:
+    if args.quantized_save and rank_zero:
         flat_utils.save_quantized_weights_with_safetensors(args, model, quantizers)
 
     if args.distribute_model:
         utils.distribute_model(model)
     else:
-        model.to(utils.DEV)
+        model.to(device)
     
-    # Evaluating PPL
-    for eval_dataset in ["wikitext2", "c4"]:
-        logger.info(eval_dataset)
-        testloader = data_utils.get_loaders(
-                args,
-                eval_dataset,
-                seed=args.seed,
-                model=args.model,
-                seqlen=model.seqlen,
-                hf_token=args.hf_token,
-                eval_mode=True
-            )
-        dataset_ppl = eval_utils.ppl_eval(model, testloader)
-        logger.info(dataset_ppl)
+    if rank_zero:
+        for eval_dataset in ["wikitext2", "c4"]:
+            logger.info(eval_dataset)
+            testloader = data_utils.get_loaders(
+                    args,
+                    eval_dataset,
+                    seed=args.seed,
+                    model=args.model,
+                    seqlen=model.seqlen,
+                    hf_token=args.hf_token,
+                    eval_mode=True
+                )
+            dataset_ppl = eval_utils.ppl_eval(model, testloader)
+            logger.info(dataset_ppl)
 
 
-    if args.lm_eval:
+    if args.lm_eval and rank_zero:
         import lm_eval
         from lm_eval import utils as lm_eval_utils
         from lm_eval.models.huggingface import HFLM
@@ -95,6 +106,9 @@ def main():
         metric_vals = {task: result for task, result in results.items()}
         metric_vals['acc_avg'] = round(sum(metric_vals.values()) / len(metric_vals.values()), 2)
         logger.info(metric_vals)
+
+    if dist_env is not None:
+        utils.destroy_distributed()
 
 
 if __name__ == '__main__':

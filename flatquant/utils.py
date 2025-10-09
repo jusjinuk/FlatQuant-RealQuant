@@ -1,6 +1,11 @@
 import random
+import os
+from dataclasses import dataclass
+from typing import Optional
+
 import numpy as np
 import torch
+import torch.distributed as dist
 import transformers
 
 import logging
@@ -12,6 +17,24 @@ from accelerate.utils import get_balanced_memory
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 DEV = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
+
+
+@dataclass
+class DistEnv:
+    rank: int
+    world_size: int
+    local_rank: int
+    device: torch.device
+    ddp_size: int
+    tp_size: int
+    dp_rank: int
+    tp_rank: int
+    dp_group: Optional[dist.ProcessGroup]
+    tp_group: Optional[dist.ProcessGroup]
+
+    @property
+    def is_distributed(self) -> bool:
+        return self.world_size > 1
 
 
 def skip(*args, **kwargs):
@@ -50,6 +73,76 @@ def cleanup_memory(verbose=True) -> None:
                 f" ({(memory_after - memory_before) / (1024 ** 3):.2f} GB)"
             )
 
+def _infer_device(local_rank: int) -> torch.device:
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        return torch.device('cuda', local_rank)
+    return torch.device('cpu')
+
+
+def init_distributed(args) -> Optional[DistEnv]:
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    if world_size <= 1:
+        return None
+
+    backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend)
+
+    rank = dist.get_rank()
+    local_rank = int(os.environ.get('LOCAL_RANK', rank))
+    device = _infer_device(local_rank)
+
+    ddp_size = max(1, getattr(args, 'ddp_size', 1))
+    tp_size = max(1, getattr(args, 'tp_size', 1))
+    if ddp_size * tp_size != world_size:
+        if getattr(args, 'ddp_size', 1) == 1 and getattr(args, 'tp_size', 1) == 1:
+            ddp_size = world_size
+            tp_size = 1
+        else:
+            raise ValueError(
+                f"ddp_size ({ddp_size}) * tp_size ({tp_size}) must match WORLD_SIZE ({world_size})."
+            )
+
+    dp_rank = rank // tp_size
+    tp_rank = rank % tp_size
+
+    tp_group = None
+    if tp_size > 1:
+        tp_groups = []
+        for dp_idx in range(ddp_size):
+            ranks = [dp_idx * tp_size + tp_idx for tp_idx in range(tp_size)]
+            tp_groups.append(dist.new_group(ranks=ranks))
+        tp_group = tp_groups[dp_rank]
+
+    dp_group = None
+    if ddp_size > 1:
+        dp_groups = []
+        for tp_idx in range(tp_size):
+            ranks = [tp_idx + tp_size * dp_idx for dp_idx in range(ddp_size)]
+            dp_groups.append(dist.new_group(ranks=ranks))
+        dp_group = dp_groups[tp_rank]
+
+    return DistEnv(
+        rank=rank,
+        world_size=world_size,
+        local_rank=local_rank,
+        device=device,
+        ddp_size=ddp_size,
+        tp_size=tp_size,
+        dp_rank=dp_rank,
+        tp_rank=tp_rank,
+        dp_group=dp_group,
+        tp_group=tp_group,
+    )
+
+
+def destroy_distributed() -> None:
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
+
+
 def distribute_model(model) -> None:
     """Distribute the model across available GPUs. NB: only implemented for Llama-2/3/Qwen-2."""
     no_split_module_classes = ['LlamaDecoderLayer', 'Qwen2DecoderLayer']
@@ -71,4 +164,3 @@ def seed_everything(seed=0) -> None:
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True
     transformers.set_seed(seed)
-

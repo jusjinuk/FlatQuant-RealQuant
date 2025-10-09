@@ -169,6 +169,9 @@ def parser_gen():
     parser.add_argument('--offload', action = "store_true", default = False,
                         help = 'Do offloading')
         
+    parser.add_argument('--ddp_size', type=int, default=1, help='Number of data-parallel ranks to use during QAT training.')
+    parser.add_argument('--tp_size', type=int, default=1, help='Number of tensor-parallel ranks per data-parallel replica.')
+        
     # Add learnable scale flag
     parser.add_argument('--learn_scale', action = "store_true", default = False,
                         help = 'Train scales & zero points')

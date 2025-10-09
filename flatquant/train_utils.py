@@ -1,15 +1,27 @@
 import os
 import time
 import gc
+import math
 import functools
 from contextlib import nullcontext
+from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 import transformers
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from flatquant.function_utils import set_require_grad_all, get_n_set_parameters_byname, get_paras_dict_by_name, check_params_grad
 from flatquant.quant_utils import set_quantizer_state
+from flatquant.utils import DistEnv
+
+try:
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import ShardingStrategy
+except (ImportError, ModuleNotFoundError):
+    FSDP = None
+    ShardingStrategy = None
 
 
 def trainable_parameters_num(model, name = None):
@@ -29,21 +41,30 @@ def trainable_parameters_num(model, name = None):
 def _bytes_to_mb(x): 
     return float(x) / (1024**2)
 
-def cali_flat_quant(args, model, dataloader, dev, logger):
-    if torch.cuda.is_available():
-        torch.cuda.synchronize(dev)
-        torch.cuda.reset_peak_memory_stats(dev)
+
+def _unwrap_module(module):
+    if isinstance(module, DDP):
+        return _unwrap_module(module.module)
+    if FSDP is not None and isinstance(module, FSDP):
+        return _unwrap_module(module.module)
+    return module
+
+def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[DistEnv] = None):
+    dist_enabled = dist_env is not None and getattr(dist_env, "world_size", 1) > 1
+    device = dist_env.device if dist_enabled else dev
+
+    if torch.cuda.is_available() and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.empty_cache()
 
     model.eval()
     use_cache = model.config.use_cache
     model.config.use_cache = False
 
-    # check trainable parameters
     for name, param in model.named_parameters():
         param.requires_grad = False
 
-    # activate AMP
     if args.deactive_amp:
         dtype = torch.float32
         traincast = nullcontext
@@ -51,71 +72,99 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
         dtype = torch.float16 if isinstance(model, transformers.LlamaForCausalLM) else torch.bfloat16
         traincast = functools.partial(torch.amp.autocast, device_type="cuda", dtype=dtype)
 
-    # move embedding layer and first layer to target device
     layers = model.model.layers
-    layers[0] = layers[0].to(dev)
-    model.model.embed_tokens = model.model.embed_tokens.to(dev)
+    layers[0] = layers[0].to(device)
+    model.model.embed_tokens = model.model.embed_tokens.to(device)
     if hasattr(model.model, "rotary_emb"):
-        model.model.rotary_emb = model.model.rotary_emb.to(dev)
+        model.model.rotary_emb = model.model.rotary_emb.to(device)
 
-    # catch the first layer input
-    if args.offload:
-        inps = torch.zeros((args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device='cpu')
-    else:
-        inps = torch.zeros(
-            (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
-        )
+    total_nsamples = min(args.nsamples, len(dataloader))
+    if total_nsamples == 0:
+        raise ValueError("No calibration samples provided.")
+
+    ddp_size = dist_env.ddp_size if dist_enabled else 1
+    tp_size = dist_env.tp_size if dist_enabled else 1
+    dp_rank = dist_env.dp_rank if dist_enabled else 0
+    tp_group = dist_env.tp_group if dist_enabled else None
+    dp_group = dist_env.dp_group if dist_enabled else None
+    rank_zero = (not dist_enabled) or dist_env.rank == 0
+
+    samples_per_rank = total_nsamples if ddp_size == 1 else math.ceil(total_nsamples / ddp_size)
+    local_indices = [(idx * ddp_size + dp_rank) % total_nsamples for idx in range(samples_per_rank)]
+    local_nsamples = len(local_indices)
+
+    base_accumulate = args.cali_bsz_accumulate_step
+    accumulate_steps = base_accumulate
+    if dist_enabled and ddp_size > 1:
+        accumulate_steps = max(1, math.ceil(base_accumulate / ddp_size))
+        if rank_zero and accumulate_steps * ddp_size != base_accumulate:
+            logger.warning(
+                "cali_bsz_accumulate_step (%d) is not divisible by ddp_size (%d); "
+                "using per-rank accumulation=%d which changes the effective gradient accumulation.",
+                base_accumulate,
+                ddp_size,
+                accumulate_steps,
+            )
+
+    if dist_enabled and ddp_size > 1 and rank_zero and total_nsamples % ddp_size != 0:
+        logger.warning("Calibration samples are re-used on some ranks to keep step counts aligned; consider increasing nsamples or adjusting ddp_size.")
+
+    storage_device = 'cpu' if args.offload else device
+    inps = torch.zeros((local_nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=storage_device)
     cache = {"i": 0}
+
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
             self.module = module
 
         def forward(self, inp, **kwargs):
-            #inps[cache["i"]] = inp
+            if cache["i"] >= local_nsamples:
+                raise ValueError
+            tensor = inp.squeeze(0)
             if args.offload:
-                inps[cache["i"]].copy_(inp.squeeze(0).to('cpu', dtype=dtype))
+                inps[cache["i"]].copy_(tensor.to('cpu', dtype=dtype))
             else:
-                inps[cache["i"]].copy_(inp.squeeze(0))
+                inps[cache["i"]].copy_(tensor)
             cache["i"] += 1
-            cache["attention_mask"] = kwargs["attention_mask"]
-            cache["position_ids"] = kwargs["position_ids"]
+            cache["attention_mask"] = kwargs.get("attention_mask")
+            cache["position_ids"] = kwargs.get("position_ids")
             raise ValueError
+
     layers[0] = Catcher(layers[0])
     with torch.no_grad():
-        for batch in dataloader:
-            if cache["i"] >= args.nsamples:
+        for idx in local_indices:
+            if cache["i"] >= local_nsamples:
                 break
+            sample = dataloader[idx][0]
             try:
-                sample = batch[0]
-                model(sample.to(dev))
+                model(sample.to(device))
             except ValueError:
                 pass
-    position_ids = cache["position_ids"]
-    attention_mask = cache["attention_mask"]
+
+    attention_mask = cache.get("attention_mask")
+    position_ids = cache.get("position_ids")
     if attention_mask is not None:
-        attention_mask_batch = attention_mask.repeat(args.cali_bsz, 1, 1, 1).to(dev).float()
+        attention_mask = attention_mask.to(device)
+        attention_mask_batch = attention_mask.repeat(args.cali_bsz, 1, 1, 1).float()
     else:
         attention_mask_batch = None
-    position_ids = position_ids.to(dev) if position_ids is not None else None
-    
-    # move embedding layer and first layer to cpu
+    position_ids = position_ids.to(device) if position_ids is not None else None
+
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
     model.model.embed_tokens = model.model.embed_tokens.cpu()
     if hasattr(model.model, "rotary_emb"):
         model.model.rotary_emb = model.model.rotary_emb.cpu()
-    # raise ValueError("Only support for llama-2/Llama-3/qwen-2 now")
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available() and device.type == "cuda":
+        torch.cuda.empty_cache()
 
-    # same input of first layer for fp model and quant model
-    fp_inps = inps   # take output of fp model as input
+    fp_inps = inps
     if args.offload:
-        fp_outs = torch.zeros((args.nsamples, model.seqlen, model.config.hidden_size),
-                            dtype=dtype, device='cpu')
+        fp_outs = torch.zeros((local_nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device='cpu')
     else:
-        fp_outs = torch.zeros_like(inps, dtype=dtype, device=dev)  # take output of fp model as input
-    fp_outs.zero_()  
+        fp_outs = torch.zeros_like(inps, dtype=dtype, device=device)
+    fp_outs.zero_()
 
     loss_func = torch.nn.MSELoss()
     # start training
@@ -123,97 +172,154 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
     num_train_layer = len(layers)
     mse_dict = {}
     for i in range(num_train_layer):
-        if not i == 0:
+        if not i == 0 and rank_zero:
             logger.info(f"========= Layer {i} =========")
-        dtype_dict = {}
-        layer = layers[i].to(dev)
-        for name, param in layer.named_parameters():
-            dtype_dict[name] = param.dtype
-        with torch.no_grad():
-            layer.float()
+        layer = layers[i]
+        dtype_dict = {name: param.dtype for name, param in layer.named_parameters()}
+        layer = layer.to(device=device, dtype=torch.float32)
 
-        layer.self_attn._ori_mode = True
-        layer.mlp._ori_mode = True
+        def _fsdp_full_params_ctx(module_wrapper):
+            inner = module_wrapper
+            while isinstance(inner, DDP):
+                inner = inner.module
+            if FSDP is not None and isinstance(inner, FSDP):
+                return FSDP.summon_full_params(inner, recurse=False)
+            return nullcontext()
+
+        grad_enable_tags = []
+        if args.cali_trans:
+            grad_enable_tags.append("trans.linear")
+        if args.add_diag:
+            grad_enable_tags.append("trans.diag_scale")
+        if args.lwc:
+            grad_enable_tags.append("clip_factor_w")
+        if args.lac:
+            grad_enable_tags.append("clip_factor_a")
+        if args.learn_weight:
+            grad_enable_tags.extend([
+                "learnable_weight",
+                "input_layernorm.weight",
+                "post_attention_layernorm.weight",
+            ])
+        if args.learn_scale:
+            grad_enable_tags.append(".scale")
+            if args.w_asym:
+                grad_enable_tags.append(".zero")
+
+        for tag in grad_enable_tags:
+            for name, param in layer.named_parameters():
+                if tag in name:
+                    param.requires_grad = True
+
+        has_trainable = any(param.requires_grad for param in layer.parameters())
+
+        wrapped_layer = layer
+        if dist_enabled and tp_size > 1:
+            if FSDP is None or ShardingStrategy is None:
+                raise RuntimeError("FSDP is required for tensor parallel training but is not available in this environment.")
+            wrapped_layer = FSDP(
+                wrapped_layer,
+                process_group=tp_group,
+                sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+                device_id=device if device.type == 'cuda' else None,
+                use_orig_params=True,
+            )
+        if dist_enabled and ddp_size > 1 and has_trainable:
+            device_ids = [device.index] if device.type == 'cuda' else None
+            wrapped_layer = DDP(wrapped_layer, device_ids=device_ids, process_group=dp_group, broadcast_buffers=False)
+        layer = wrapped_layer
+        module = _unwrap_module(layer)
+        with _fsdp_full_params_ctx(layer):
+            with torch.no_grad():
+                module.float()
+
+        module.self_attn._ori_mode = True
+        module.mlp._ori_mode = True
         with torch.no_grad():
-            if args.offload:
-                for off in range(0, args.nsamples, args.cali_bsz):          
-                    bs = min(args.cali_bsz, args.nsamples - off)              
-                    x = fp_inps[off:off+bs].to(dev)  
-                    if attention_mask_batch is None:                          
-                        am = None                                      
-                    else:                                               
-                        am = attention_mask_batch if bs == args.cali_bsz else attention_mask.repeat(bs, 1, 1, 1).to(dev).float() 
-                    y = layer(x, attention_mask=am, position_ids=position_ids)[0] 
-                    fp_outs[off:off+bs].copy_(y.detach().to('cpu', dtype = dtype))
-            else:
-                for j in range(args.nsamples):
-                    fp_outs[j] = layer(fp_inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-        layer.self_attn._ori_mode = False
-        layer.mlp._ori_mode = False
+            for off in range(0, local_nsamples, args.cali_bsz):
+                bs = min(args.cali_bsz, local_nsamples - off)
+                x = fp_inps[off:off+bs]
+                if x.device != device:
+                    x = x.to(device, non_blocking=device.type == 'cuda')
+                if attention_mask_batch is None:
+                    am = None
+                else:
+                    if bs == args.cali_bsz:
+                        am = attention_mask_batch
+                    else:
+                        am = attention_mask.repeat(bs, 1, 1, 1).to(device, non_blocking=device.type == 'cuda').float()
+                y = layer(x, attention_mask=am, position_ids=position_ids)[0]
+                if args.offload:
+                    fp_outs[off:off+bs].copy_(y.detach().to('cpu', dtype=dtype))
+                else:
+                    fp_outs[off:off+bs] = y.detach()
+        module.self_attn._ori_mode = False
+        module.mlp._ori_mode = False
         if not args.no_apply_trans:
-            if args.diag_init == "sq_style":
-                layer.self_attn.init_diag_scale(alpha=args.diag_alpha)
-                layer.mlp.init_diag_scale(alpha=args.diag_alpha)
-            elif args.diag_init == "one_style":
-                pass
-            else:
-                raise NotImplementedError
+            with _fsdp_full_params_ctx(layer):
+                if args.diag_init == "sq_style":
+                    module.self_attn.init_diag_scale(alpha=args.diag_alpha)
+                    module.mlp.init_diag_scale(alpha=args.diag_alpha)
+                elif args.diag_init == "one_style":
+                    pass
+                else:
+                    raise NotImplementedError
 
-        layer = layer.to(dev)
-        set_require_grad_all(layer, False)
+        module = module.to(device)
+        set_require_grad_all(module, False)
         trained_params, paras_name = [], []
         flat_param, clip_param, weight_param, scale_param = [], [], [], []
         if args.cali_trans:
-            trained_params.append({"params": get_n_set_parameters_byname(layer, ["trans.linear", ]), "lr": args.flat_lr, "tag": "trans.linear"})
+            trained_params.append({"params": get_n_set_parameters_byname(module, ["trans.linear", ]), "lr": args.flat_lr, "tag": "trans.linear"})
             paras_name.append("trans.linear")
             flat_param.append("trans.linear")
         if args.add_diag:
-            trained_params.append({"params": get_n_set_parameters_byname(layer, ["trans.diag_scale", ]), "lr": args.flat_lr, "tag": "trans.diag_scale"})
+            trained_params.append({"params": get_n_set_parameters_byname(module, ["trans.diag_scale", ]), "lr": args.flat_lr, "tag": "trans.diag_scale"})
             paras_name.append("trans.diag_scale")
             flat_param.append("trans.diag_scale")
         if args.lwc:
-            trained_params.append({"params": get_n_set_parameters_byname(layer, ["clip_factor_w", ]), "lr": args.flat_lr * 10, "tag": "clip_factor_w"})
+            trained_params.append({"params": get_n_set_parameters_byname(module, ["clip_factor_w", ]), "lr": args.flat_lr * 10, "tag": "clip_factor_w"})
             paras_name.append("clip_factor_w")
             clip_param.append("clip_factor_w")
         if args.lac:
-            trained_params.append({"params": get_n_set_parameters_byname(layer, ["clip_factor_a", ]), "lr": args.flat_lr * 10, "tag": "clip_factor_a"})
+            trained_params.append({"params": get_n_set_parameters_byname(module, ["clip_factor_a", ]), "lr": args.flat_lr * 10, "tag": "clip_factor_a"})
             paras_name.append("clip_factor_a")
             clip_param.append("clip_factor_a")
 
         if args.learn_weight:
-            trained_params.append({"params": get_n_set_parameters_byname(layer, ["learnable_weight", ]), "lr": args.weight_lr, "tag": "weight"})
+            trained_params.append({"params": get_n_set_parameters_byname(module, ["learnable_weight", ]), "lr": args.weight_lr, "tag": "weight"})
             paras_name.append("weight")
             weight_param.append("weight")
 
-            trained_params.append({"params": get_n_set_parameters_byname(layer, ["input_layernorm.weight", ]), "lr": args.weight_lr, "tag": "input_layernorm"})
+            trained_params.append({"params": get_n_set_parameters_byname(module, ["input_layernorm.weight", ]), "lr": args.weight_lr, "tag": "input_layernorm"})
             paras_name.append("input_layernorm")
             weight_param.append("input_layernorm")
             
-            trained_params.append({"params": get_n_set_parameters_byname(layer, ["post_attention_layernorm.weight", ]), "lr": args.weight_lr, "tag": "post_attention_layernorm"})
+            trained_params.append({"params": get_n_set_parameters_byname(module, ["post_attention_layernorm.weight", ]), "lr": args.weight_lr, "tag": "post_attention_layernorm"})
             paras_name.append("post_attention_layernorm")
             weight_param.append("post_attention_layernorm")
 
         if args.learn_scale:
-            trained_params.append({"params": get_n_set_parameters_byname(layer, [".scale", ]), "lr": args.scale_lr, "tag": "scale"})
+            trained_params.append({"params": get_n_set_parameters_byname(module, [".scale", ]), "lr": args.scale_lr, "tag": "scale"})
             paras_name.append("scale")
             scale_param.append("scale")
 
             if args.w_asym:
-                trained_params.append({"params": get_n_set_parameters_byname(layer, [".zero", ]), "lr": args.scale_lr, "tag": "zero"})
+                trained_params.append({"params": get_n_set_parameters_byname(module, [".zero", ]), "lr": args.scale_lr, "tag": "zero"})
                 paras_name.append("zero")
                 scale_param.append("zero")
 
-        accumulate_steps = args.cali_bsz_accumulate_step
+        schedule_steps = max(1, math.ceil(local_nsamples / (args.cali_bsz * accumulate_steps)))
         optimizer = torch.optim.AdamW(trained_params)
         empty_optimizer_1 = torch.optim.AdamW([torch.tensor(0)], lr=args.flat_lr)
         empty_optimizer_0 = torch.optim.AdamW([torch.tensor(0)], lr=args.flat_lr * 10)
         empty_optimizer_2 = torch.optim.AdamW([torch.tensor(0)], lr=args.weight_lr)
         empty_optimizer_3 = torch.optim.AdamW([torch.tensor(0)], lr=args.scale_lr)
         group_idx = { g.get("tag", f"group{i}"): i for i, g in enumerate(optimizer.param_groups) }
-        scheduler_main = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_1, T_max=args.epochs * (args.nsamples // (args.cali_bsz * accumulate_steps)), eta_min=args.flat_lr * 1e-3)
-        scheduler_clip = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_0, T_max=args.epochs * (args.nsamples // (args.cali_bsz * accumulate_steps)), eta_min=args.flat_lr * 1e-3)
-        scheduler_weight = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_2, T_max=args.epochs * (args.nsamples // (args.cali_bsz * accumulate_steps)), eta_min=args.weight_lr / 20)
-        scheduler_scale = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_3, T_max=args.epochs * (args.nsamples // (args.cali_bsz * accumulate_steps)), eta_min=args.scale_lr / 20)
+        scheduler_main = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_1, T_max=args.epochs * schedule_steps, eta_min=args.flat_lr * 1e-3)
+        scheduler_clip = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_0, T_max=args.epochs * schedule_steps, eta_min=args.flat_lr * 1e-3)
+        scheduler_weight = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_2, T_max=args.epochs * schedule_steps, eta_min=args.weight_lr / 20)
+        scheduler_scale = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_3, T_max=args.epochs * schedule_steps, eta_min=args.scale_lr / 20)
         if args.warmup:
             scheduler_warmup = torch.optim.lr_scheduler.LinearLR(empty_optimizer_1, start_factor=0.01, total_iters=16)
             scheduler = torch.optim.lr_scheduler.ChainedScheduler([scheduler_warmup, scheduler_main])
@@ -223,8 +329,8 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
             scheduler = scheduler_main
         # check_params_grad(layer)
         # set_quantizer_state(layer, False)
-        if i == 0:
-            trainable_number, trainable_params = trainable_parameters_num(layer)
+        if i == 0 and rank_zero:
+            trainable_number, trainable_params = trainable_parameters_num(module)
             logger.info(f"trainable parameter number: {trainable_number}")
             logger.info(f"trainable parameter name:")
             for name, number in trainable_params:
@@ -232,37 +338,48 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
             logger.info(f"========= Layer {i} =========")
 
         for epoch in range(args.epochs):
-            if epoch == 0:
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize(dev)
-                    torch.cuda.reset_peak_memory_stats(dev)
+            if epoch == 0 and torch.cuda.is_available() and device.type == 'cuda':
+                torch.cuda.synchronize(device)
+                torch.cuda.reset_peak_memory_stats(device)
 
-            mse = 0
+            mse = 0.0
             start_tick = time.time()
             with traincast():
                 iter = 0
                 optimizer.zero_grad()
 
-                for off in range(0, args.nsamples, args.cali_bsz):            
-                    bs = min(args.cali_bsz, args.nsamples - off)             
-                    x = fp_inps[off:off+bs].to(dev, non_blocking=True)      
-                    y_ref = fp_outs[off:off+bs].to(dev, non_blocking=True) 
-                    am = None if attention_mask_batch is None else (attention_mask_batch if bs == args.cali_bsz else attention_mask.repeat(bs,1,1,1).to(dev, non_blocking=True).float()) 
-                    quant_out = layer(x, attention_mask=am, position_ids=position_ids)[0] 
+                for off in range(0, local_nsamples, args.cali_bsz):
+                    bs = min(args.cali_bsz, local_nsamples - off)
+                    x = fp_inps[off:off+bs]
+                    y_ref = fp_outs[off:off+bs]
+                    if x.device != device:
+                        x = x.to(device, non_blocking=device.type == 'cuda')
+                    if y_ref.device != device:
+                        y_ref = y_ref.to(device, non_blocking=device.type == 'cuda')
+                    if attention_mask_batch is None:
+                        am = None
+                    else:
+                        if bs == args.cali_bsz:
+                            am = attention_mask_batch
+                        else:
+                            am = attention_mask.repeat(bs,1,1,1).to(device, non_blocking=device.type == 'cuda').float()
+                    quant_out = layer(x, attention_mask=am, position_ids=position_ids)[0]
                     if torch.isnan(quant_out).any():
-                        logger.warning(f"NaN detected in layer {i}, epoch {epoch}")
-                        for name, param in layer.named_parameters():
+                        if rank_zero:
+                            logger.warning(f"NaN detected in layer {i}, epoch {epoch}")
+                        for name, param in module.named_parameters():
                             if param.requires_grad and torch.isnan(param).any():
-                                logger.warning(f"NaN in parameter: {name}")
+                                if rank_zero:
+                                    logger.warning(f"NaN in parameter: {name}")
                     loss = loss_func(y_ref, quant_out)
-                    mse += loss.detach().cpu()
+                    mse += loss.detach().float().item()
                     if loss == 0:
                         print("loss = 0!")
                         import pdb; pdb.set_trace()
                     loss = loss / accumulate_steps
                     loss = loss / loss.clone().detach().clamp_min(1e-12)
                     loss.backward()
-                    if (iter + 1) % accumulate_steps == 0 or off + bs >= args.nsamples:
+                    if (iter + 1) % accumulate_steps == 0 or off + bs >= local_nsamples:
                         optimizer.step()
                         if scheduler is not None: 
                             scheduler.step()
@@ -280,11 +397,11 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
                         optimizer.zero_grad()
                     iter += 1
 
-            if epoch == 0:
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize(dev)
-                    peak_alloc = torch.cuda.max_memory_allocated(dev)
-                    peak_resvd = torch.cuda.max_memory_reserved(dev)
+            if epoch == 0 and torch.cuda.is_available() and device.type == 'cuda':
+                torch.cuda.synchronize(device)
+                peak_alloc = torch.cuda.max_memory_allocated(device)
+                peak_resvd = torch.cuda.max_memory_reserved(device)
+                if rank_zero:
                     logger.info(f"[MEM] layer {i} epoch {epoch} peak_alloc={_bytes_to_mb(peak_alloc):.1f}MB "
                                 f"peak_resvd={_bytes_to_mb(peak_resvd):.1f}MB")
             cur_flat_lr = optimizer.state_dict()['param_groups'][0]['lr']
@@ -293,40 +410,49 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
             if args.learn_scale:
                 cur_scale_lr = optimizer.state_dict()['param_groups'][group_idx["scale"]]['lr']
             
-            if args.learn_weight:
-                if args.learn_scale:
-                    logger.info(f"layer {i} lwc lac iter {epoch}, flat_lr {cur_flat_lr:.8f}, weight_lr {cur_weight_lr:.8f}, scale_lr {cur_scale_lr:.8f}, time {time.time() - start_tick:.6f}s, mse: {mse / accumulate_steps:.8f}, mean_mse: {mse / iter :.8f}" )
-                else:
-                    logger.info(f"layer {i} lwc lac iter {epoch}, flat_lr {cur_flat_lr:.8f}, weight_lr {cur_weight_lr:.8f}, time {time.time() - start_tick:.6f}s, mse: {mse / accumulate_steps:.8f}, mean_mse: {mse / iter :.8f}" )
+            mse_tensor = torch.tensor(mse, device=device if device.type == 'cuda' else 'cpu')
+            if dist_enabled and ddp_size > 1:
+                dist.all_reduce(mse_tensor, op=dist.ReduceOp.SUM, group=dp_group)
+                mse_value = mse_tensor.item() / ddp_size
             else:
-                if args.learn_scale:
-                    logger.info(f"layer {i} lwc lac iter {epoch}, flat_lr {cur_flat_lr:.8f}, scale_lr {cur_scale_lr:.8f}, time {time.time() - start_tick:.6f}s, mse: {mse / accumulate_steps:.8f}, mean_mse: {mse / iter :.8f}" )
+                mse_value = mse_tensor.item()
+
+            if rank_zero:
+                if args.learn_weight:
+                    if args.learn_scale:
+                        logger.info(f"layer {i} lwc lac iter {epoch}, flat_lr {cur_flat_lr:.8f}, weight_lr {cur_weight_lr:.8f}, scale_lr {cur_scale_lr:.8f}, time {time.time() - start_tick:.6f}s, mse: {mse_value / accumulate_steps:.8f}, mean_mse: {mse_value / iter :.8f}")
+                    else:
+                        logger.info(f"layer {i} lwc lac iter {epoch}, flat_lr {cur_flat_lr:.8f}, weight_lr {cur_weight_lr:.8f}, time {time.time() - start_tick:.6f}s, mse: {mse_value / accumulate_steps:.8f}, mean_mse: {mse_value / iter :.8f}")
                 else:
-                    logger.info(f"layer {i} lwc lac iter {epoch}, flat_lr {cur_flat_lr:.8f}, time {time.time() - start_tick:.6f}s, mse: {mse / accumulate_steps:.8f}, mean_mse: {mse / iter :.8f}" )
+                    if args.learn_scale:
+                        logger.info(f"layer {i} lwc lac iter {epoch}, flat_lr {cur_flat_lr:.8f}, scale_lr {cur_scale_lr:.8f}, time {time.time() - start_tick:.6f}s, mse: {mse_value / accumulate_steps:.8f}, mean_mse: {mse_value / iter :.8f}")
+                    else:
+                        logger.info(f"layer {i} lwc lac iter {epoch}, flat_lr {cur_flat_lr:.8f}, time {time.time() - start_tick:.6f}s, mse: {mse_value / accumulate_steps:.8f}, mean_mse: {mse_value / iter :.8f}")
 
         fp_inps, fp_outs = fp_outs, fp_inps
-        layers[i] = layer.to(dtype=torch.float16, device="cpu")
-        #layers[i] = layer.to("cpu")
-        cur = get_paras_dict_by_name(layer, required_names=paras_name)
+        layers[i] = module.to(dtype=torch.float16, device="cpu")
+        cur = get_paras_dict_by_name(module, required_names=paras_name)
         cur = {k: v.detach().cpu().clone() for k, v in cur.items()}
-        torch.save(cur, os.path.join(args.exp_dir, f"flat_parameters.pth"))
+        if not dist_enabled or rank_zero:
+            torch.save(cur, os.path.join(args.exp_dir, f"flat_parameters.pth"))
+            logger.info("saved paramaters at {}".format(os.path.join(args.exp_dir, f"flat_parameters.pth")))
         del cur
-        logger.info("saved paramaters at {}".format(os.path.join(args.exp_dir, f"flat_parameters.pth")))
         try: del optimizer
         except: pass
         try: del scheduler, scheduler_main, scheduler_warmup
         except: pass
-        for name, param in layer.named_parameters():
+        for name, param in module.named_parameters():
             param.requires_grad = False
             if name in dtype_dict.keys():
                 param.data = param.to(dtype_dict[name])
         del layer
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available() and device.type == 'cuda':
+            torch.cuda.empty_cache()
 
     del inps, fp_inps, fp_outs
     gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available() and device.type == 'cuda':
+        torch.cuda.empty_cache()
     model.config.use_cache = use_cache
     return model
-
