@@ -1,7 +1,6 @@
 import argparse
 import gc
 import pprint
-import numpy as np
 import torch
 import time
 import os
@@ -14,6 +13,8 @@ import json
 
 import torch.nn as nn
 from contextlib import contextmanager
+from datasets import load_dataset
+from tqdm import tqdm
 
 model_configs = [
     "./modelzoo/llama-2-hf/llama-2-7b-hf",
@@ -72,34 +73,63 @@ def silence_torch_module_repr():
         nn.Module.__repr__ = orig
 
 
-def lm_eval_func(args, model, config_name):
-    import lm_eval
-    from lm_eval import utils as lm_eval_utils
-    from lm_eval.models.huggingface import HFLM
-    
+def load_eval_data(dataset_name, tokenizer, max_length, hf_token=None):
+    if dataset_name == "wikitext2":
+        data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test", token=hf_token)
+        enc = tokenizer("\n\n".join(data["text"]), return_tensors="pt")
+        input_ids = enc.input_ids
+    elif dataset_name == "c4":
+        data = load_dataset(
+            "allenai/c4",
+            data_files={"validation": "en/c4-validation.00000-of-00008.json.gz"},
+            split="validation",
+            token=hf_token,
+        )
+        enc = tokenizer(" ".join(data[:1100]["text"]), return_tensors="pt")
+        input_ids = enc.input_ids[:, :(256 * max_length)]
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
+
+    usable_tokens = (input_ids.shape[1] // max_length) * max_length
+    if usable_tokens == 0:
+        raise ValueError("Not enough tokens for evaluation.")
+    return input_ids[:, :usable_tokens]
+
+
+@torch.no_grad()
+def perplexity(model, input_ids, max_length):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    input_ids = input_ids.to(device)
+
+    nsamples = input_ids.shape[1] // max_length
+    losses = []
+    for i in tqdm(range(nsamples), desc="Evaluating perplexity"):
+        batch = input_ids[:, i * max_length : (i + 1) * max_length]
+        outputs = model(batch)
+        logits = outputs.logits[:, :-1, :].contiguous()
+        labels = batch[:, 1:].contiguous()
+        loss = torch.nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1),
+        )
+        losses.append(loss * max_length)
+
+    ppl = torch.exp(torch.stack(losses).sum() / (len(losses) * max_length))
+    return ppl.item()
+
+
+def ppl_eval_func(args, model, config_name):
     model.eval()
-    model = model.cuda()
-    
-    tokenizer = transformers.AutoTokenizer.from_pretrained(config_name, use_fast=False, use_auth_token=args.hf_token)
-
-    hflm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=args.lm_eval_batch_size)
-
-    task_names = args.tasks
-
-    results = {}
-    for task_name in task_names:
-        print(f"Evaluating {task_name}...")
-        result = lm_eval.simple_evaluate(hflm, tasks=[task_name], batch_size=args.lm_eval_batch_size)['results']
-        result = result[task_name]
-        acc = round(result.get('acc_norm,none', result['acc,none']) * 100, 2)
-        results[task_name] = acc
-        print(f"acc: {acc}%")
-    metric_vals = {task: result for task, result in results.items()}
-    metric_vals['acc_avg'] = round(sum(metric_vals.values()) / len(metric_vals.values()), 2)
-    print(f"------------------------- ({config_name}) ------------------------")
-    print(metric_vals)
-
-    return metric_vals
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        config_name,
+        use_fast=False,
+        use_auth_token=args.hf_token,
+    )
+    input_ids = load_eval_data(args.dataset, tokenizer, args.max_length, hf_token=args.hf_token)
+    ppl = perplexity(model, input_ids, args.max_length)
+    print(f"[{config_name}] {args.dataset} perplexity: {ppl:.4f}")
+    return ppl
 
 
 # Load from safetensors format
@@ -266,11 +296,10 @@ def benchmark(args):
         args.fuseLN, args.trans = False, "none"
         args.online_trans = set()
         model = get_model_fp16(config_name)
-        model.to('cuda')
         with silence_torch_module_repr():
-            results = lm_eval_func(args, model, config_name)
+            ppl = ppl_eval_func(args, model, config_name)
         
-        final_results_fp16[f"{config_name}"] = results
+        final_results_fp16[f"{config_name}"] = ppl
         del model
         _cleanup()
             
@@ -288,34 +317,30 @@ def benchmark(args):
 
             model = get_model_quantized(args, config_name, weight_dir)
             with silence_torch_module_repr():
-                results = lm_eval_func(args, model, config_name)
+                ppl = ppl_eval_func(args, model, config_name)
             
-            final_results_flat[f"{config_name}"] = results
+            final_results_flat[f"{config_name}"] = ppl
             del model
             _cleanup()
 
     for k, v in final_results_fp16.items():
         print(f'------------------------- FP16 {k}------------------------')
-        print(v)
+        print(f"{args.dataset}: {v}")
 
     for k, v in final_results_flat.items():
         print(f"------------------------- Flat {k}------------------------")
-        print(v)
+        print(f"{args.dataset}: {v}")
 
            
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
-    parser.add_argument(
-        '--tasks',
-        nargs='+',
-        default=["piqa", "hellaswag", "arc_easy", "arc_challenge", "winogrande", "lambada_openai"],
-        help='Tasks to evaluate on LM Eval.')
-    parser.add_argument('--lm_eval_batch_size', type=int, default=128, help='Batch size for evaluation with lm eval harness.')
     parser.add_argument('--hf_token', type=str, default=None, help='HuggingFace token for model access.')
     parser.add_argument('--model-config', type=str, default=None, help='Optional single model config to evaluate.')
     parser.add_argument('--checkpoint', type=str, default=None, help='Optional path to a quantized checkpoint directory or file.')
+    parser.add_argument('--dataset', type=str, default="wikitext2", choices=["wikitext2", "c4"], help='Dataset used for perplexity evaluation.')
+    parser.add_argument('--max_length', type=int, default=2048, help='Sequence length for each evaluation chunk.')
     
     args = parser.parse_args()
     benchmark(args)

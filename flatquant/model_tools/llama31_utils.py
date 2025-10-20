@@ -13,6 +13,8 @@ from flatquant.flat_linear import FlatQuantizedLinear
 from transformers.models.llama.modeling_llama import LlamaMLP, LlamaAttention, \
                                                      apply_rotary_pos_emb, repeat_kv
 
+from tqdm import tqdm
+
 
 class FlatQuantLlamaMLP(LlamaMLP):
     def __init__(self, args, module: LlamaMLP):
@@ -336,7 +338,7 @@ class FlatQuantLlamaAttention(LlamaAttention):
 def apply_flatquant_to_llama_31(args, model):
     skip_initialization()
     # Replace module with FlatQuant version
-    for layer in range(model.config.num_hidden_layers):
+    for layer in tqdm(range(model.config.num_hidden_layers), desc="Applying FlatQuant to model"):
         # attn
         model.model.layers[layer].self_attn = FlatQuantLlamaAttention(args, model.model.layers[layer].self_attn)
         # mlp

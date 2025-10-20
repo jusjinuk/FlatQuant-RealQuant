@@ -12,6 +12,7 @@ import logging
 
 from accelerate import dispatch_model, infer_auto_device_map
 from accelerate.utils import get_balanced_memory
+from torch.distributed.device_mesh import init_device_mesh
 
 # These flags disable using TensorFloat-32 tensor cores (to avoid numerical issues)
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -26,11 +27,12 @@ class DistEnv:
     local_rank: int
     device: torch.device
     ddp_size: int
-    tp_size: int
+    fsdp_size: int
     dp_rank: int
-    tp_rank: int
+    fsdp_rank: int
     dp_group: Optional[dist.ProcessGroup]
-    tp_group: Optional[dist.ProcessGroup]
+    fsdp_group: Optional[dist.ProcessGroup]
+    device_mesh: Optional[object]
 
     @property
     def is_distributed(self) -> bool:
@@ -93,35 +95,36 @@ def init_distributed(args) -> Optional[DistEnv]:
     local_rank = int(os.environ.get('LOCAL_RANK', rank))
     device = _infer_device(local_rank)
 
-    ddp_size = max(1, getattr(args, 'ddp_size', 1))
-    tp_size = max(1, getattr(args, 'tp_size', 1))
-    if ddp_size * tp_size != world_size:
-        if getattr(args, 'ddp_size', 1) == 1 and getattr(args, 'tp_size', 1) == 1:
-            ddp_size = world_size
-            tp_size = 1
-        else:
-            raise ValueError(
-                f"ddp_size ({ddp_size}) * tp_size ({tp_size}) must match WORLD_SIZE ({world_size})."
-            )
+    ddp_size = args.ddp_size
+    fsdp_size = args.fsdp_size
+    assert ddp_size * fsdp_size == world_size, "ddp_size ({ddp_size}) * fsdp_size ({fsdp_size}) must match WORLD_SIZE ({world_size})."
 
-    dp_rank = rank // tp_size
-    tp_rank = rank % tp_size
+    dp_rank = rank // fsdp_size
+    fsdp_rank = rank % fsdp_size
 
-    tp_group = None
-    if tp_size > 1:
-        tp_groups = []
+    fsdp_group = None
+    if fsdp_size > 1:
+        fsdp_groups = []
         for dp_idx in range(ddp_size):
-            ranks = [dp_idx * tp_size + tp_idx for tp_idx in range(tp_size)]
-            tp_groups.append(dist.new_group(ranks=ranks))
-        tp_group = tp_groups[dp_rank]
+            ranks = [dp_idx * fsdp_size + shard_idx for shard_idx in range(fsdp_size)]
+            fsdp_groups.append(dist.new_group(ranks=ranks))
+        fsdp_group = fsdp_groups[dp_rank]
 
     dp_group = None
     if ddp_size > 1:
         dp_groups = []
-        for tp_idx in range(tp_size):
-            ranks = [tp_idx + tp_size * dp_idx for dp_idx in range(ddp_size)]
+        for shard_idx in range(fsdp_size):
+            ranks = [shard_idx + fsdp_size * dp_idx for dp_idx in range(ddp_size)]
             dp_groups.append(dist.new_group(ranks=ranks))
-        dp_group = dp_groups[tp_rank]
+        dp_group = dp_groups[fsdp_rank]
+
+    device_mesh = None
+    if ddp_size > 1 or fsdp_size > 1:
+        device_mesh = init_device_mesh(
+            device_type="cuda",
+            mesh_shape=(ddp_size, fsdp_size),
+            mesh_dim_names=("dp", "fsdp"),
+        )
 
     return DistEnv(
         rank=rank,
@@ -129,11 +132,12 @@ def init_distributed(args) -> Optional[DistEnv]:
         local_rank=local_rank,
         device=device,
         ddp_size=ddp_size,
-        tp_size=tp_size,
+        fsdp_size=fsdp_size,
         dp_rank=dp_rank,
-        tp_rank=tp_rank,
+        fsdp_rank=fsdp_rank,
         dp_group=dp_group,
-        tp_group=tp_group,
+        fsdp_group=fsdp_group,
+        device_mesh=device_mesh,
     )
 
 

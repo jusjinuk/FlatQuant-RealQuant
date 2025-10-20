@@ -10,19 +10,13 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 import transformers
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 from flatquant.function_utils import set_require_grad_all, get_n_set_parameters_byname, get_paras_dict_by_name, check_params_grad
 from flatquant.quant_utils import set_quantizer_state
 from flatquant.utils import DistEnv
 
-try:
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-    from torch.distributed.fsdp import ShardingStrategy
-except (ImportError, ModuleNotFoundError):
-    FSDP = None
-    ShardingStrategy = None
-
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy
 
 def trainable_parameters_num(model, name = None):
     params = []
@@ -41,13 +35,21 @@ def trainable_parameters_num(model, name = None):
 def _bytes_to_mb(x): 
     return float(x) / (1024**2)
 
-
 def _unwrap_module(module):
-    if isinstance(module, DDP):
-        return _unwrap_module(module.module)
-    if FSDP is not None and isinstance(module, FSDP):
-        return _unwrap_module(module.module)
+    while FSDP is not None and isinstance(module, FSDP):
+        module = module.module
     return module
+
+def _demote_nonfloat_params_to_buffers(root: nn.Module) -> int:
+    """Convert any non-floating dtype nn.Parameter (e.g., int64/bool) into buffers."""
+    changed = 0
+    for mod in root.modules():
+        for name, p in list(mod.named_parameters(recurse=False)):
+            if isinstance(p, nn.Parameter) and not torch.is_floating_point(p):
+                delattr(mod, name)
+                mod.register_buffer(name, p.detach())
+                changed += 1
+    return changed
 
 def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[DistEnv] = None):
     dist_enabled = dist_env is not None and getattr(dist_env, "world_size", 1) > 1
@@ -61,6 +63,10 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
     model.eval()
     use_cache = model.config.use_cache
     model.config.use_cache = False
+
+    demoted = _demote_nonfloat_params_to_buffers(model)
+    if (not dist_enabled) or dist_env.rank == 0:
+        logger.info(f"[FSDP] Demoted {demoted} non-float params to buffers")
 
     for name, param in model.named_parameters():
         param.requires_grad = False
@@ -83,9 +89,8 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
         raise ValueError("No calibration samples provided.")
 
     ddp_size = dist_env.ddp_size if dist_enabled else 1
-    tp_size = dist_env.tp_size if dist_enabled else 1
+    fsdp_size = dist_env.fsdp_size if dist_enabled else 1
     dp_rank = dist_env.dp_rank if dist_enabled else 0
-    tp_group = dist_env.tp_group if dist_enabled else None
     dp_group = dist_env.dp_group if dist_enabled else None
     rank_zero = (not dist_enabled) or dist_env.rank == 0
 
@@ -179,11 +184,8 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
         layer = layer.to(device=device, dtype=torch.float32)
 
         def _fsdp_full_params_ctx(module_wrapper):
-            inner = module_wrapper
-            while isinstance(inner, DDP):
-                inner = inner.module
-            if FSDP is not None and isinstance(inner, FSDP):
-                return FSDP.summon_full_params(inner, recurse=False)
+            if FSDP is not None and isinstance(module_wrapper, FSDP):
+                return FSDP.summon_full_params(module_wrapper, recurse=False)
             return nullcontext()
 
         grad_enable_tags = []
@@ -214,19 +216,15 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
         has_trainable = any(param.requires_grad for param in layer.parameters())
 
         wrapped_layer = layer
-        if dist_enabled and tp_size > 1:
-            if FSDP is None or ShardingStrategy is None:
-                raise RuntimeError("FSDP is required for tensor parallel training but is not available in this environment.")
+        if dist_enabled and has_trainable and (fsdp_size > 1 or ddp_size > 1):
             wrapped_layer = FSDP(
                 wrapped_layer,
-                process_group=tp_group,
-                sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-                device_id=device if device.type == 'cuda' else None,
-                use_orig_params=True,
+                device_id = device,
+                sharding_strategy = ShardingStrategy.HYBRID_SHARD,
+                device_mesh = dist_env.device_mesh,
+                sync_module_states = True,
+                use_orig_params = True
             )
-        if dist_enabled and ddp_size > 1 and has_trainable:
-            device_ids = [device.index] if device.type == 'cuda' else None
-            wrapped_layer = DDP(wrapped_layer, device_ids=device_ids, process_group=dp_group, broadcast_buffers=False)
         layer = wrapped_layer
         module = _unwrap_module(layer)
         with _fsdp_full_params_ctx(layer):
