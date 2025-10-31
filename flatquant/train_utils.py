@@ -263,7 +263,6 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
                 else:
                     raise NotImplementedError
 
-        module = module.to(device)
         set_require_grad_all(module, False)
         trained_params, paras_name = [], []
         flat_param, clip_param, weight_param, scale_param = [], [], [], []
@@ -330,9 +329,9 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
         if i == 0 and rank_zero:
             trainable_number, trainable_params = trainable_parameters_num(module)
             logger.info(f"trainable parameter number: {trainable_number}")
-            logger.info(f"trainable parameter name:")
-            for name, number in trainable_params:
-                logger.info(f"{name}: {number}")
+            # logger.info(f"trainable parameter name:")
+            # for name, number in trainable_params:
+            #     logger.info(f"{name}: {number}")
             logger.info(f"========= Layer {i} =========")
 
         for epoch in range(args.epochs):
@@ -428,6 +427,8 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
                         logger.info(f"layer {i} lwc lac iter {epoch}, flat_lr {cur_flat_lr:.8f}, time {time.time() - start_tick:.6f}s, mse: {mse_value / accumulate_steps:.8f}, mean_mse: {mse_value / iter :.8f}")
 
         fp_inps, fp_outs = fp_outs, fp_inps
+        if isinstance(layer, FSDP):
+            layer.cpu()
         layers[i] = module.to(dtype=torch.float16, device="cpu")
         cur = get_paras_dict_by_name(module, required_names=paras_name)
         cur = {k: v.detach().cpu().clone() for k, v in cur.items()}
@@ -435,10 +436,10 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
             torch.save(cur, os.path.join(args.exp_dir, f"flat_parameters.pth"))
             logger.info("saved paramaters at {}".format(os.path.join(args.exp_dir, f"flat_parameters.pth")))
         del cur
-        try: del optimizer
-        except: pass
-        try: del scheduler, scheduler_main, scheduler_warmup
-        except: pass
+        del optimizer
+        if args.warmup:
+            del scheduler_warmup
+        del scheduler, scheduler_main
         for name, param in module.named_parameters():
             param.requires_grad = False
             if name in dtype_dict.keys():

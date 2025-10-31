@@ -70,6 +70,10 @@ def main():
     else:
         model.to(device)
     
+    if args.ddp_size > 1 or args.fsdp_size > 1:
+        logger.info(f"Skipping evaluation for DDP or FSDP")
+        return
+    
     if rank_zero:
         for eval_dataset in ["wikitext2", "c4"]:
             logger.info(eval_dataset)
