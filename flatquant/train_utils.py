@@ -199,7 +199,7 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
             grad_enable_tags.append("clip_factor_a")
         if args.learn_weight:
             grad_enable_tags.extend([
-                "learnable_weight",
+                "linear.weight",
                 "input_layernorm.weight",
                 "post_attention_layernorm.weight",
             ])
@@ -284,9 +284,9 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
             clip_param.append("clip_factor_a")
 
         if args.learn_weight:
-            trained_params.append({"params": get_n_set_parameters_byname(module, ["learnable_weight", ]), "lr": args.weight_lr, "tag": "weight"})
-            paras_name.append("weight")
-            weight_param.append("weight")
+            trained_params.append({"params": get_n_set_parameters_byname(module, ["linear.weight", ]), "lr": args.weight_lr, "tag": "linear"})
+            paras_name.append("linear")
+            weight_param.append("linear")
 
             trained_params.append({"params": get_n_set_parameters_byname(module, ["input_layernorm.weight", ]), "lr": args.weight_lr, "tag": "input_layernorm"})
             paras_name.append("input_layernorm")
@@ -329,9 +329,9 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
         if i == 0 and rank_zero:
             trainable_number, trainable_params = trainable_parameters_num(module)
             logger.info(f"trainable parameter number: {trainable_number}")
-            # logger.info(f"trainable parameter name:")
-            # for name, number in trainable_params:
-            #     logger.info(f"{name}: {number}")
+            logger.info(f"trainable parameter name:")
+            for name, number in trainable_params:
+                logger.info(f"{name}: {number}")
             logger.info(f"========= Layer {i} =========")
 
         for epoch in range(args.epochs):
@@ -403,7 +403,7 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
                                 f"peak_resvd={_bytes_to_mb(peak_resvd):.1f}MB")
             cur_flat_lr = optimizer.state_dict()['param_groups'][0]['lr']
             if args.learn_weight:
-                cur_weight_lr = optimizer.state_dict()['param_groups'][group_idx["weight"]]['lr']
+                cur_weight_lr = optimizer.state_dict()['param_groups'][group_idx["linear"]]['lr']
             if args.learn_scale:
                 cur_scale_lr = optimizer.state_dict()['param_groups'][group_idx["scale"]]['lr']
             

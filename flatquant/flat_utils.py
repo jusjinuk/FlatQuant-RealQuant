@@ -70,7 +70,7 @@ def save_flat_matrices(args, model, rank=None):
         layer.mlp.rep_matrix_only()
         paras_name = ["trans.matrix", "trans.diag_scale", "clip_factor_w", "clip_factor_a"]
         if args.learn_weight:
-            paras_name.append("learnable_weight")
+            paras_name.append("linear.weight")
             paras_name.append("input_layernorm.weight")
             paras_name.append("post_attention_layernorm.weight")
         if args.learn_scale:
@@ -115,9 +115,6 @@ def save_quantized_weights_with_safetensors(args, model, quantizers, sym = True)
     for name, param in model.named_parameters():
         if name.endswith('.weight') or name.endswith('.bias'):
             layer_name = name.rsplit('.', 1)[0]
-        elif name.endswith('.learnable_weight'):
-            layer_name = name.rsplit('.', 1)[0] + '.linear'
-            name = name.rsplit('.', 1)[0] + '.linear.weight'
         else:
             layer_name = name
             

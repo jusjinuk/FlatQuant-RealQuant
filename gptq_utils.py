@@ -337,9 +337,9 @@ def _fwrd(model, dev, args):
                 layer_weight_bits, perchannel=True, sym=not(args.w_asym), mse=args.gptq_mse
             )
 
-            W = subset[name].learnable_weight.data
+            W = subset[name].weight.data
             w_dtype = W.dtype
-            subset[name].learnable_weight.data = quantizer.quantize(W).to(w_dtype)
+            subset[name].weight.data = quantizer.quantize(W).to(w_dtype)
             quantizers['model.layers.%d.%s.linear' % (i, name)] = quantizer.cpu()
 
         extra = find_qlayers(layer, layers=[torch.nn.Linear])

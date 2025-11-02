@@ -15,10 +15,8 @@ class FlatQuantizedLinear(nn.Module):
         self.weight_quantizer.configure(args.w_bits, perchannel=True, sym=not(args.w_asym), mse=False)
         self.act_quantizer = ActivationQuantizer(bits=args.a_bits, sym=not(args.a_asym), lac=args.lac, groupsize=args.a_groupsize, )
 
-        self.learnable_weight = self.linear.weight
-    
         if args.learn_scale:
-            self.weight_quantizer._init_scale_zero(self.learnable_weight)
+            self.weight_quantizer._init_scale_zero(self.linear.weight)
 
         self.lwc = args.lwc
         if self.lwc:
@@ -48,7 +46,7 @@ class FlatQuantizedLinear(nn.Module):
         return self.linear(hidden_states)
 
     def _train_forward(self, hidden_states, qa_trans=None, out_trans=None):
-        weight = self.learnable_weight
+        weight = self.linear.weight
         # quantization-adaptive transform
         if qa_trans is not None:
             weight = self.apply_trans(weight, qa_trans)
