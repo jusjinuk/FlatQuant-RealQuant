@@ -1,3 +1,5 @@
+import os
+os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
 import transformers
 
 import flatquant.utils as utils
@@ -46,8 +48,8 @@ def main():
             train_utils.cali_flat_quant(args, model, trainloader, device, logger=logger, dist_env=dist_env)
         if args.save_matrix and not args.reload_matrix and rank_zero:
             flat_utils.save_flat_matrices(args, model)
-        flat_utils.reparameterize_model(model)
         if rank_zero:
+            flat_utils.reparameterize_model(model)
             logger.info("Finished reparameterize model.")
 
     if args.w_bits < 16 and rank_zero:
@@ -65,32 +67,30 @@ def main():
     if args.quantized_save and rank_zero:
         flat_utils.save_quantized_weights_with_safetensors(args, model, quantizers)
 
-    if args.distribute_model:
-        utils.distribute_model(model)
-    else:
-        model.to(device)
-    
     if args.ddp_size > 1 or args.fsdp_size > 1:
         logger.info(f"Skipping evaluation for DDP or FSDP")
         return
-    
-    if rank_zero:
-        for eval_dataset in ["wikitext2", "c4"]:
-            logger.info(eval_dataset)
-            testloader = data_utils.get_loaders(
-                    args,
-                    eval_dataset,
-                    seed=args.seed,
-                    model=args.model,
-                    seqlen=model.seqlen,
-                    hf_token=args.hf_token,
-                    eval_mode=True
-                )
-            dataset_ppl = eval_utils.ppl_eval(model, testloader)
-            logger.info(dataset_ppl)
 
+    if args.distribute_model:
+        utils.distribute_model(model)
+    else:
+        model.to(device)   
 
-    if args.lm_eval and rank_zero:
+    for eval_dataset in ["wikitext2", "c4"]:
+        logger.info(eval_dataset)
+        testloader = data_utils.get_loaders(
+                args,
+                eval_dataset,
+                seed=args.seed,
+                model=args.model,
+                seqlen=model.seqlen,
+                hf_token=args.hf_token,
+                eval_mode=True
+            )
+        dataset_ppl = eval_utils.ppl_eval(model, testloader)
+        logger.info(dataset_ppl)
+
+    if args.lm_eval:
         import lm_eval
         from lm_eval import utils as lm_eval_utils
         from lm_eval.models.huggingface import HFLM

@@ -2,6 +2,7 @@ import os
 import torch
 from flatquant.function_utils import get_paras_dict_by_name
 import logging
+from tqdm import tqdm
 
 def kronecker_matmul(x, hadL, hadR):
     """equivalent to
@@ -28,7 +29,7 @@ def reparameterize_ln(ln, trans):
 
 
 def reparameterize_model(model):
-    for idx in range(model.config.num_hidden_layers):
+    for idx in tqdm(range(model.config.num_hidden_layers), "Reparameterizing model"):
         layer = model.model.layers[idx]
         layer.self_attn.reparameterize()
         layer.mlp.reparameterize()
@@ -64,7 +65,7 @@ def load_flat_parameters(args, model, path=None):
 
 def save_flat_matrices(args, model, rank=None):
     flat_matrices = {}
-    for i in range(len(model.model.layers)):
+    for i in tqdm(range(len(model.model.layers)), desc="Saving flat matrices"):
         layer = model.model.layers[i]
         layer.self_attn.rep_matrix_only()
         layer.mlp.rep_matrix_only()

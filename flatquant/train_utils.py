@@ -11,8 +11,7 @@ import torch.nn as nn
 import torch.distributed as dist
 import transformers
 
-from flatquant.function_utils import set_require_grad_all, get_n_set_parameters_byname, get_paras_dict_by_name, check_params_grad
-from flatquant.quant_utils import set_quantizer_state
+from flatquant.function_utils import set_require_grad_all, get_n_set_parameters_byname, get_paras_dict_by_name
 from flatquant.utils import DistEnv
 
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -51,6 +50,13 @@ def _demote_nonfloat_params_to_buffers(root: nn.Module) -> int:
                 changed += 1
     return changed
 
+def print_cpu_memory_usage(message: str):
+    import psutil
+    memory_info = psutil.virtual_memory()
+    used_memory = memory_info.used
+    total_memory = memory_info.total
+    print(f"{message}: {used_memory / 1024 ** 3:.1f} GB / {total_memory / 1024 ** 3:.1f} GB")
+
 def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[DistEnv] = None):
     dist_enabled = dist_env is not None and getattr(dist_env, "world_size", 1) > 1
     device = dist_env.device if dist_enabled else dev
@@ -84,9 +90,7 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
     if hasattr(model.model, "rotary_emb"):
         model.model.rotary_emb = model.model.rotary_emb.to(device)
 
-    total_nsamples = min(args.nsamples, len(dataloader))
-    if total_nsamples == 0:
-        raise ValueError("No calibration samples provided.")
+    total_nsamples = args.nsamples
 
     ddp_size = dist_env.ddp_size if dist_enabled else 1
     fsdp_size = dist_env.fsdp_size if dist_enabled else 1
@@ -227,9 +231,6 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
             )
         layer = wrapped_layer
         module = _unwrap_module(layer)
-        with _fsdp_full_params_ctx(layer):
-            with torch.no_grad():
-                module.float()
 
         module.self_attn._ori_mode = True
         module.mlp._ori_mode = True
@@ -314,13 +315,13 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
         empty_optimizer_3 = torch.optim.AdamW([torch.tensor(0)], lr=args.scale_lr)
         group_idx = { g.get("tag", f"group{i}"): i for i, g in enumerate(optimizer.param_groups) }
         scheduler_main = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_1, T_max=args.epochs * schedule_steps, eta_min=args.flat_lr * 1e-3)
-        scheduler_clip = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_0, T_max=args.epochs * schedule_steps, eta_min=args.flat_lr * 1e-3)
+        scheduler_clip = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_0, T_max=args.epochs * schedule_steps, eta_min=args.flat_lr * 10 * 1e-3)
         scheduler_weight = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_2, T_max=args.epochs * schedule_steps, eta_min=args.weight_lr / 20)
         scheduler_scale = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_3, T_max=args.epochs * schedule_steps, eta_min=args.scale_lr / 20)
         if args.warmup:
             scheduler_warmup = torch.optim.lr_scheduler.LinearLR(empty_optimizer_1, start_factor=0.01, total_iters=16)
             scheduler = torch.optim.lr_scheduler.ChainedScheduler([scheduler_warmup, scheduler_main])
-            scheduler_warmup_2 = torch.optim.lr_scheduler.LinearLR(empty_optimizer_1, start_factor=0.01, total_iters=16)
+            scheduler_warmup_2 = torch.optim.lr_scheduler.LinearLR(empty_optimizer_0, start_factor=0.01, total_iters=16)
             scheduler_clip = torch.optim.lr_scheduler.ChainedScheduler([scheduler_warmup_2, scheduler_clip])
         else:
             scheduler = scheduler_main
@@ -427,24 +428,42 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
                         logger.info(f"layer {i} lwc lac iter {epoch}, flat_lr {cur_flat_lr:.8f}, time {time.time() - start_tick:.6f}s, mse: {mse_value / accumulate_steps:.8f}, mean_mse: {mse_value / iter :.8f}")
 
         fp_inps, fp_outs = fp_outs, fp_inps
+
+        optimizer.zero_grad(set_to_none=True)
+        x = y_ref = quant_out = am = None
+        del optimizer, trained_params, scheduler, scheduler_main
+        del empty_optimizer_1, empty_optimizer_0, empty_optimizer_2, empty_optimizer_3
+
+        if isinstance(layer, FSDP) and fsdp_size > 1:
+            ctx = FSDP.summon_full_params(layer, recurse=False, writeback=False, offload_to_cpu=True, rank0_only=True)
+        else:
+            ctx = nullcontext()
+
+        with ctx:
+            if rank_zero:
+                cur = get_paras_dict_by_name(module, required_names=paras_name)
+                cur = {k: v.detach().cpu().clone() for k, v in cur.items()}
+                if not dist_enabled or rank_zero:
+                    torch.save(cur, os.path.join(args.exp_dir, f"flat_parameters.pth"))
+                    logger.info("saved paramaters at {}".format(os.path.join(args.exp_dir, f"flat_parameters.pth")))
+                del cur
+        
         if isinstance(layer, FSDP):
-            layer.cpu()
-        layers[i] = module.to(dtype=torch.float16, device="cpu")
-        cur = get_paras_dict_by_name(module, required_names=paras_name)
-        cur = {k: v.detach().cpu().clone() for k, v in cur.items()}
-        if not dist_enabled or rank_zero:
-            torch.save(cur, os.path.join(args.exp_dir, f"flat_parameters.pth"))
-            logger.info("saved paramaters at {}".format(os.path.join(args.exp_dir, f"flat_parameters.pth")))
-        del cur
-        del optimizer
-        if args.warmup:
-            del scheduler_warmup
-        del scheduler, scheduler_main
-        for name, param in module.named_parameters():
-            param.requires_grad = False
-            if name in dtype_dict.keys():
-                param.data = param.to(dtype_dict[name])
-        del layer
+            del layer
+            gc.collect()
+
+        if rank_zero:
+            print_cpu_memory_usage(f"[Rank {dist_env.rank}] before to_cpu")
+            for name, param in module.named_parameters():
+                param.requires_grad = False
+                if name in dtype_dict.keys():
+                    param.data = param.to(dtype_dict[name])
+            layers[i] = module.to(device="cpu")
+            print_cpu_memory_usage(f"[Rank {dist_env.rank}] after to_cpu")
+        else:
+            layers[i] = module.to_empty(device="meta")
+
+        del module
         gc.collect()
         if torch.cuda.is_available() and device.type == 'cuda':
             torch.cuda.empty_cache()

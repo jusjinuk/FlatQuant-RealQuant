@@ -291,17 +291,18 @@ def benchmark(args):
     for config_name in configs:
         pprint.pprint(vars(args))
 
-        print(f'------------------------- FP16 ------------------------')
-        # FP16
-        args.fuseLN, args.trans = False, "none"
-        args.online_trans = set()
-        model = get_model_fp16(config_name)
-        with silence_torch_module_repr():
-            ppl = ppl_eval_func(args, model, config_name)
-        
-        final_results_fp16[f"{config_name}"] = ppl
-        del model
-        _cleanup()
+        if args.eval_fp16:
+            print(f'------------------------- FP16 ------------------------')
+            # FP16
+            args.fuseLN, args.trans = False, "none"
+            args.online_trans = set()
+            model = get_model_fp16(config_name)
+            with silence_torch_module_repr():
+                ppl = ppl_eval_func(args, model, config_name)
+            
+            final_results_fp16[f"{config_name}"] = ppl
+            del model
+            _cleanup()
             
         # FlatQuant
         args.fuseLN, args.trans = False, "matmul"
@@ -340,6 +341,7 @@ if __name__ == '__main__':
     parser.add_argument('--model-config', type=str, default=None, help='Optional single model config to evaluate.')
     parser.add_argument('--checkpoint', type=str, default=None, help='Optional path to a quantized checkpoint directory or file.')
     parser.add_argument('--dataset', type=str, default="wikitext2", choices=["wikitext2", "c4"], help='Dataset used for perplexity evaluation.')
+    parser.add_argument('--eval-fp16', action="store_true", default=False, help='Evaluate the model in FP16.')
     parser.add_argument('--max_length', type=int, default=2048, help='Sequence length for each evaluation chunk.')
     
     args = parser.parse_args()

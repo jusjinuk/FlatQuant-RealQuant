@@ -284,8 +284,7 @@ def rtn_fwrd(model, dev, args):
     for i in tqdm.tqdm(range(len(layers)), desc="(RtN Quant.) Layers"):
         layer = layers[i].to(dev)
 
-        subset = find_qlayers(layer,
-                                            layers=[torch.nn.Linear])
+        subset = find_qlayers(layer, layers=[torch.nn.Linear])
 
         for name in subset:
             layer_weight_bits = args.w_bits
@@ -337,9 +336,9 @@ def _fwrd(model, dev, args):
                 layer_weight_bits, perchannel=True, sym=not(args.w_asym), mse=args.gptq_mse
             )
 
-            W = subset[name].weight.data
+            W = subset[name].linear.weight.data
             w_dtype = W.dtype
-            subset[name].weight.data = quantizer.quantize(W).to(w_dtype)
+            subset[name].linear.weight.data = quantizer.quantize(W).to(w_dtype)
             quantizers['model.layers.%d.%s.linear' % (i, name)] = quantizer.cpu()
 
         extra = find_qlayers(layer, layers=[torch.nn.Linear])
