@@ -83,8 +83,8 @@ def main():
             dataset_ppl = eval_utils.ppl_eval(model, testloader)
             logger.info(dataset_ppl)
     
-    if args.ddp_size > 1 or args.fsdp_size > 1:
-        logger.info(f"Skipping lm_eval evaluation for DDP or FSDP")
+    if args.ddp_size > 1:
+        logger.info(f"Skipping lm_eval evaluation for DDP")
         return
 
     if args.lm_eval:

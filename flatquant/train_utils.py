@@ -11,11 +11,9 @@ import torch.nn as nn
 import torch.distributed as dist
 import transformers
 
+from torch.nn.parallel import DistributedDataParallel as DDP
 from flatquant.function_utils import set_require_grad_all, get_n_set_parameters_byname, get_paras_dict_by_name
 from flatquant.utils import DistEnv
-
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import ShardingStrategy
 
 def trainable_parameters_num(model, name = None):
     params = []
@@ -35,20 +33,9 @@ def _bytes_to_mb(x):
     return float(x) / (1024**2)
 
 def _unwrap_module(module):
-    while FSDP is not None and isinstance(module, FSDP):
-        module = module.module
+    if isinstance(module, DDP):
+        return module.module
     return module
-
-def _demote_nonfloat_params_to_buffers(root: nn.Module) -> int:
-    """Convert any non-floating dtype nn.Parameter (e.g., int64/bool) into buffers."""
-    changed = 0
-    for mod in root.modules():
-        for name, p in list(mod.named_parameters(recurse=False)):
-            if isinstance(p, nn.Parameter) and not torch.is_floating_point(p):
-                delattr(mod, name)
-                mod.register_buffer(name, p.detach())
-                changed += 1
-    return changed
 
 def print_cpu_memory_usage(message: str):
     import psutil
@@ -70,10 +57,6 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
     use_cache = model.config.use_cache
     model.config.use_cache = False
 
-    demoted = _demote_nonfloat_params_to_buffers(model)
-    if (not dist_enabled) or dist_env.rank == 0:
-        logger.info(f"[FSDP] Demoted {demoted} non-float params to buffers")
-
     for name, param in model.named_parameters():
         param.requires_grad = False
 
@@ -90,10 +73,9 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
     if hasattr(model.model, "rotary_emb"):
         model.model.rotary_emb = model.model.rotary_emb.to(device)
 
-    total_nsamples = args.nsamples
+    total_nsamples = min(args.nsamples, len(dataloader))
 
     ddp_size = dist_env.ddp_size if dist_enabled else 1
-    fsdp_size = dist_env.fsdp_size if dist_enabled else 1
     dp_rank = dist_env.dp_rank if dist_enabled else 0
     dp_group = dist_env.dp_group if dist_enabled else None
     rank_zero = (not dist_enabled) or dist_env.rank == 0
@@ -107,7 +89,7 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
     if dist_enabled and ddp_size > 1:
         accumulate_steps = max(1, math.ceil(base_accumulate / ddp_size))
         if rank_zero and accumulate_steps * ddp_size != base_accumulate:
-            logger.warning(
+            raise ValueError(
                 "cali_bsz_accumulate_step (%d) is not divisible by ddp_size (%d); "
                 "using per-rank accumulation=%d which changes the effective gradient accumulation.",
                 base_accumulate,
@@ -187,11 +169,6 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
         dtype_dict = {name: param.dtype for name, param in layer.named_parameters()}
         layer = layer.to(device=device, dtype=torch.float32)
 
-        def _fsdp_full_params_ctx(module_wrapper):
-            if FSDP is not None and isinstance(module_wrapper, FSDP):
-                return FSDP.summon_full_params(module_wrapper, recurse=False)
-            return nullcontext()
-
         grad_enable_tags = []
         if args.cali_trans:
             grad_enable_tags.append("trans.linear")
@@ -220,14 +197,9 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
         has_trainable = any(param.requires_grad for param in layer.parameters())
 
         wrapped_layer = layer
-        if dist_enabled and has_trainable and (fsdp_size > 1 or ddp_size > 1):
-            wrapped_layer = FSDP(
-                wrapped_layer,
-                device_id = device,
-                sharding_strategy = ShardingStrategy.HYBRID_SHARD,
-                device_mesh = dist_env.device_mesh,
-                sync_module_states = True,
-                use_orig_params = True
+        if dist_enabled and has_trainable and ddp_size > 1:
+            wrapped_layer = DDP(
+                wrapped_layer, device_ids=[device.index], process_group=dp_group, broadcast_buffers=False
             )
         layer = wrapped_layer
         module = _unwrap_module(layer)
@@ -255,14 +227,13 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
         module.self_attn._ori_mode = False
         module.mlp._ori_mode = False
         if not args.no_apply_trans:
-            with _fsdp_full_params_ctx(layer):
-                if args.diag_init == "sq_style":
-                    module.self_attn.init_diag_scale(alpha=args.diag_alpha)
-                    module.mlp.init_diag_scale(alpha=args.diag_alpha)
-                elif args.diag_init == "one_style":
-                    pass
-                else:
-                    raise NotImplementedError
+            if args.diag_init == "sq_style":
+                module.self_attn.init_diag_scale(alpha=args.diag_alpha)
+                module.mlp.init_diag_scale(alpha=args.diag_alpha)
+            elif args.diag_init == "one_style":
+                pass
+            else:
+                raise NotImplementedError
 
         set_require_grad_all(module, False)
         trained_params, paras_name = [], []
@@ -315,7 +286,7 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
         empty_optimizer_3 = torch.optim.AdamW([torch.tensor(0)], lr=args.scale_lr)
         group_idx = { g.get("tag", f"group{i}"): i for i, g in enumerate(optimizer.param_groups) }
         scheduler_main = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_1, T_max=args.epochs * schedule_steps, eta_min=args.flat_lr * 1e-3)
-        scheduler_clip = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_0, T_max=args.epochs * schedule_steps, eta_min=args.flat_lr * 1e-3)
+        scheduler_clip = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_0, T_max=args.epochs * schedule_steps, eta_min=args.flat_lr * 10 * 1e-3)
         scheduler_weight = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_2, T_max=args.epochs * schedule_steps, eta_min=args.weight_lr / 20)
         scheduler_scale = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_3, T_max=args.epochs * schedule_steps, eta_min=args.scale_lr / 20)
         if args.warmup:
@@ -361,23 +332,32 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
                             am = attention_mask_batch
                         else:
                             am = attention_mask.repeat(bs,1,1,1).to(device, non_blocking=device.type == 'cuda').float()
-                    quant_out = layer(x, attention_mask=am, position_ids=position_ids)[0]
-                    if torch.isnan(quant_out).any():
-                        if rank_zero:
-                            logger.warning(f"NaN detected in layer {i}, epoch {epoch}")
-                        for name, param in module.named_parameters():
-                            if param.requires_grad and torch.isnan(param).any():
-                                if rank_zero:
-                                    logger.warning(f"NaN in parameter: {name}")
-                    loss = loss_func(y_ref, quant_out)
-                    mse += loss.detach().float().item()
-                    if loss == 0:
-                        print("loss = 0!")
-                        import pdb; pdb.set_trace()
-                    loss = loss / accumulate_steps
-                    loss = loss / loss.clone().detach().clamp_min(1e-12)
-                    loss.backward()
-                    if (iter + 1) % accumulate_steps == 0 or off + bs >= local_nsamples:
+                    
+                    sync_now = ((iter + 1) % accumulate_steps == 0 or off + bs >= local_nsamples)
+                    if isinstance(layer, DDP) and not sync_now:
+                        ctx = layer.no_sync()
+                    else:
+                        ctx = nullcontext()
+
+                    with ctx:
+                        quant_out = layer(x, attention_mask=am, position_ids=position_ids)[0]
+                        if torch.isnan(quant_out).any():
+                            if rank_zero:
+                                logger.warning(f"NaN detected in layer {i}, epoch {epoch}")
+                            for name, param in module.named_parameters():
+                                if param.requires_grad and torch.isnan(param).any():
+                                    if rank_zero:
+                                        logger.warning(f"NaN in parameter: {name}")
+                        loss = loss_func(y_ref, quant_out)
+                        mse += loss.detach().float().item()
+                        if loss == 0:
+                            print("loss = 0!")
+                            import pdb; pdb.set_trace()
+                        loss = loss / accumulate_steps
+                        loss = loss / loss.clone().detach().clamp_min(1e-12)
+                        loss.backward()
+
+                    if sync_now:
                         optimizer.step()
                         if scheduler is not None: 
                             scheduler.step()
@@ -434,25 +414,14 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
         del optimizer, trained_params, scheduler, scheduler_main
         del empty_optimizer_1, empty_optimizer_0, empty_optimizer_2, empty_optimizer_3
 
-        if isinstance(layer, FSDP) and fsdp_size > 1:
-            ctx = FSDP.summon_full_params(layer, recurse=False, writeback=False, offload_to_cpu=True, rank0_only=True)
-        else:
-            ctx = nullcontext()
-
-        with ctx:
-            if rank_zero:
-                cur = get_paras_dict_by_name(module, required_names=paras_name)
-                cur = {k: v.detach().cpu().clone() for k, v in cur.items()}
-                if not dist_enabled or rank_zero:
-                    torch.save(cur, os.path.join(args.exp_dir, f"flat_parameters.pth"))
-                    logger.info("saved paramaters at {}".format(os.path.join(args.exp_dir, f"flat_parameters.pth")))
-                del cur
-        
-        if isinstance(layer, FSDP):
-            del layer
-            gc.collect()
-
         if rank_zero:
+            cur = get_paras_dict_by_name(module, required_names=paras_name)
+            cur = {k: v.detach().cpu().clone() for k, v in cur.items()}
+            if not dist_enabled or rank_zero:
+                torch.save(cur, os.path.join(args.exp_dir, f"flat_parameters.pth"))
+                logger.info("saved paramaters at {}".format(os.path.join(args.exp_dir, f"flat_parameters.pth")))
+            del cur
+
             print_cpu_memory_usage(f"before to_cpu")
             for name, param in module.named_parameters():
                 param.requires_grad = False

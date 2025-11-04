@@ -27,12 +27,8 @@ class DistEnv:
     local_rank: int
     device: torch.device
     ddp_size: int
-    fsdp_size: int
     dp_rank: int
-    fsdp_rank: int
     dp_group: Optional[dist.ProcessGroup]
-    fsdp_group: Optional[dist.ProcessGroup]
-    device_mesh: Optional[object]
 
     @property
     def is_distributed(self) -> bool:
@@ -96,35 +92,14 @@ def init_distributed(args) -> Optional[DistEnv]:
     device = _infer_device(local_rank)
 
     ddp_size = args.ddp_size
-    fsdp_size = args.fsdp_size
-    assert ddp_size * fsdp_size == world_size, "ddp_size ({ddp_size}) * fsdp_size ({fsdp_size}) must match WORLD_SIZE ({world_size})."
+    assert ddp_size == world_size, "ddp_size ({ddp_size}) must match WORLD_SIZE ({world_size})."
 
-    dp_rank = rank // fsdp_size
-    fsdp_rank = rank % fsdp_size
-
-    fsdp_group = None
-    if fsdp_size > 1:
-        fsdp_groups = []
-        for dp_idx in range(ddp_size):
-            ranks = [dp_idx * fsdp_size + shard_idx for shard_idx in range(fsdp_size)]
-            fsdp_groups.append(dist.new_group(ranks=ranks))
-        fsdp_group = fsdp_groups[dp_rank]
-
+    dp_rank = rank
     dp_group = None
     if ddp_size > 1:
         dp_groups = []
-        for shard_idx in range(fsdp_size):
-            ranks = [shard_idx + fsdp_size * dp_idx for dp_idx in range(ddp_size)]
-            dp_groups.append(dist.new_group(ranks=ranks))
-        dp_group = dp_groups[fsdp_rank]
-
-    device_mesh = None
-    if ddp_size > 1 or fsdp_size > 1:
-        device_mesh = init_device_mesh(
-            device_type="cuda",
-            mesh_shape=(ddp_size, fsdp_size),
-            mesh_dim_names=("dp", "fsdp"),
-        )
+        ranks = [i for i in range(world_size)]
+        dp_group = dist.new_group(ranks=ranks)
 
     return DistEnv(
         rank=rank,
@@ -132,12 +107,8 @@ def init_distributed(args) -> Optional[DistEnv]:
         local_rank=local_rank,
         device=device,
         ddp_size=ddp_size,
-        fsdp_size=fsdp_size,
         dp_rank=dp_rank,
-        fsdp_rank=fsdp_rank,
         dp_group=dp_group,
-        fsdp_group=fsdp_group,
-        device_mesh=device_mesh,
     )
 
 
