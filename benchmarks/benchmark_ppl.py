@@ -241,8 +241,10 @@ def get_model_quantized(args, config_name, checkpoint_path = None):
     )
     dtype_old = torch.get_default_dtype()
     torch.set_default_dtype(torch.float16)
+    print(f"Loading model from {checkpoint_path}")
     with transformers.modeling_utils.no_init_weights():
         model = modeling_llama.FlatQuantLlamaForCausalLM(args=args, config=config)
+    print(f"Model loaded")
     if checkpoint_path:
         checkpoint = load_from_safetensors(checkpoint_path)
         new_checkpoint = rename_keys(checkpoint = checkpoint)
