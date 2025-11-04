@@ -414,14 +414,15 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
         del optimizer, trained_params, scheduler, scheduler_main
         del empty_optimizer_1, empty_optimizer_0, empty_optimizer_2, empty_optimizer_3
 
-        if rank_zero:
+        if rank_zero and args.save_matrix:
             cur = get_paras_dict_by_name(module, required_names=paras_name)
             cur = {k: v.detach().cpu().clone() for k, v in cur.items()}
             if not dist_enabled or rank_zero:
                 torch.save(cur, os.path.join(args.exp_dir, f"flat_parameters.pth"))
                 logger.info("saved paramaters at {}".format(os.path.join(args.exp_dir, f"flat_parameters.pth")))
             del cur
-
+        
+        if rank_zero:
             print_cpu_memory_usage(f"before to_cpu")
             for name, param in module.named_parameters():
                 param.requires_grad = False
