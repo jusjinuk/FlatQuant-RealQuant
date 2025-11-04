@@ -67,28 +67,25 @@ def main():
     if args.quantized_save and rank_zero:
         flat_utils.save_quantized_weights_with_safetensors(args, model, quantizers)
 
+    if rank_zero:
+        model.to(device)
+        for eval_dataset in ["wikitext2", "c4"]:
+            logger.info(eval_dataset)
+            testloader = data_utils.get_loaders(
+                    args,
+                    eval_dataset,
+                    seed=args.seed,
+                    model=args.model,
+                    seqlen=model.seqlen,
+                    hf_token=args.hf_token,
+                    eval_mode=True
+                )
+            dataset_ppl = eval_utils.ppl_eval(model, testloader)
+            logger.info(dataset_ppl)
+    
     if args.ddp_size > 1 or args.fsdp_size > 1:
-        logger.info(f"Skipping evaluation for DDP or FSDP")
+        logger.info(f"Skipping lm_eval evaluation for DDP or FSDP")
         return
-
-    if args.distribute_model:
-        utils.distribute_model(model)
-    else:
-        model.to(device)   
-
-    for eval_dataset in ["wikitext2", "c4"]:
-        logger.info(eval_dataset)
-        testloader = data_utils.get_loaders(
-                args,
-                eval_dataset,
-                seed=args.seed,
-                model=args.model,
-                seqlen=model.seqlen,
-                hf_token=args.hf_token,
-                eval_mode=True
-            )
-        dataset_ppl = eval_utils.ppl_eval(model, testloader)
-        logger.info(dataset_ppl)
 
     if args.lm_eval:
         import lm_eval

@@ -315,7 +315,7 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
         empty_optimizer_3 = torch.optim.AdamW([torch.tensor(0)], lr=args.scale_lr)
         group_idx = { g.get("tag", f"group{i}"): i for i, g in enumerate(optimizer.param_groups) }
         scheduler_main = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_1, T_max=args.epochs * schedule_steps, eta_min=args.flat_lr * 1e-3)
-        scheduler_clip = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_0, T_max=args.epochs * schedule_steps, eta_min=args.flat_lr * 10 * 1e-3)
+        scheduler_clip = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_0, T_max=args.epochs * schedule_steps, eta_min=args.flat_lr * 1e-3)
         scheduler_weight = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_2, T_max=args.epochs * schedule_steps, eta_min=args.weight_lr / 20)
         scheduler_scale = torch.optim.lr_scheduler.CosineAnnealingLR(empty_optimizer_3, T_max=args.epochs * schedule_steps, eta_min=args.scale_lr / 20)
         if args.warmup:
@@ -453,13 +453,13 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
             gc.collect()
 
         if rank_zero:
-            print_cpu_memory_usage(f"[Rank {dist_env.rank}] before to_cpu")
+            print_cpu_memory_usage(f"before to_cpu")
             for name, param in module.named_parameters():
                 param.requires_grad = False
                 if name in dtype_dict.keys():
                     param.data = param.to(dtype_dict[name])
             layers[i] = module.to(device="cpu")
-            print_cpu_memory_usage(f"[Rank {dist_env.rank}] after to_cpu")
+            print_cpu_memory_usage(f"after to_cpu")
         else:
             layers[i] = module.to_empty(device="meta")
 
