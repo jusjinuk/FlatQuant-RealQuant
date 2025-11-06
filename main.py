@@ -9,7 +9,7 @@ import flatquant.data_utils as data_utils
 import flatquant.eval_utils as eval_utils
 import flatquant.train_utils as train_utils
 import flatquant.flat_utils as flat_utils
-import gptq_utils
+import flatquant.gptq_utils as gptq_utils
 
 def main():
     args, logger = args_utils.parser_gen()
@@ -48,9 +48,12 @@ def main():
             train_utils.cali_flat_quant(args, model, trainloader, device, logger=logger, dist_env=dist_env)
         if args.save_matrix and not args.reload_matrix and rank_zero:
             flat_utils.save_flat_matrices(args, model)
-        if rank_zero:
+        if rank_zero and not args.blockwise_save:
             flat_utils.reparameterize_model(model)
             logger.info("Finished reparameterize model.")
+
+    if args.blockwise_save:
+        return
 
     if args.w_bits < 16 and rank_zero:
         save_dict = {}

@@ -149,11 +149,12 @@ class GPTQ:
         
         
 @torch.no_grad()
-def gptq_fwrd(model, dataloader, dev, args):
+def gptq_fwrd(model, dataloader, dev, args, layer_id=None):
     '''
     From GPTQ repo 
     TODO: Make this function general to support both OPT and LLaMA models
     '''
+    assert layer_id is None, "block-wise GPTQ is not supported yet"
     logging.info('-----GPTQ Quantization-----')
     
     use_cache = model.config.use_cache
@@ -270,13 +271,16 @@ def gptq_fwrd(model, dataloader, dev, args):
 
 
 @torch.no_grad()
-def rtn_fwrd(model, dev, args):
+def rtn_fwrd(model, dev, args, layer_id=None):
     '''
     From GPTQ repo 
     TODO: Make this function general to support both OPT and LLaMA models
     '''
     assert args.w_groupsize ==-1, "Groupsize not supported in RTN!"
-    layers = model.model.layers
+    if layer_id is None:
+        layers, offset = model.model.layers, 0
+    else:
+        layers, offset = [model], layer_id
     torch.cuda.empty_cache()
 
     quantizers = {}
@@ -300,7 +304,7 @@ def rtn_fwrd(model, dev, args):
             w_dtype = W.dtype
             quantizer.find_params(W)
             subset[name].weight.data = quantizer.quantize(W).to(w_dtype)
-            quantizers['model.layers.%d.%s' % (i, name)] = quantizer.cpu()
+            quantizers['model.layers.%d.%s' % (i + offset, name)] = quantizer.cpu()
         layers[i] = layer.cpu()
         torch.cuda.empty_cache()
         del layer
@@ -310,12 +314,15 @@ def rtn_fwrd(model, dev, args):
 
 
 @torch.no_grad()
-def _fwrd(model, dev, args):
+def _fwrd(model, dev, args, layer_id=None):
     '''
     Quantize with learned scales & zero-points
     '''
     assert args.w_groupsize ==-1, "Groupsize not supported in RTN!"
-    layers = model.model.layers
+    if layer_id is None:
+        layers, offset = model.model.layers, 0
+    else:
+        layers, offset = [model], layer_id
     torch.cuda.empty_cache()
 
     quantizers = {}
@@ -339,7 +346,7 @@ def _fwrd(model, dev, args):
             W = subset[name].linear.weight.data
             w_dtype = W.dtype
             subset[name].linear.weight.data = quantizer.quantize(W).to(w_dtype)
-            quantizers['model.layers.%d.%s.linear' % (i, name)] = quantizer.cpu()
+            quantizers['model.layers.%d.%s.linear' % (i + offset, name)] = quantizer.cpu()
 
         extra = find_qlayers(layer, layers=[torch.nn.Linear])
         for name, mod in extra.items():
@@ -356,7 +363,7 @@ def _fwrd(model, dev, args):
             w_dtype = W.dtype
             quantizer.find_params(W)
             mod.weight.data = quantizer.quantize(W).to(w_dtype)
-            quantizers[f'model.layers.{i}.{name}'] = quantizer.cpu()
+            quantizers[f'model.layers.{i + offset}.{name}'] = quantizer.cpu()
             
         layers[i] = layer.cpu()
         torch.cuda.empty_cache()

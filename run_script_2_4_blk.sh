@@ -23,18 +23,37 @@ fi
 
 NUM_PROC=$NUM_DDP_SIZE
 
+
+# --- NEW: pick a free master port in [29501, 29599] ---
+MASTER_PORT=""
+for p in $(shuf -i 29501-29599); do
+  python - <<PY 2>/dev/null
+import socket, sys
+s = socket.socket()
+try:
+    s.bind(("127.0.0.1", $p))
+except OSError:
+    sys.exit(1)
+s.close()
+PY
+  if [[ $? -eq 0 ]]; then MASTER_PORT="$p"; break; fi
+done
+if [[ -z "$MASTER_PORT" ]]; then
+  echo "No free port found in 29501-29599"
+  exit 1
+fi
+# -----------------------------------------------
+
 touch ./outputs/
 
-torchrun --nproc_per_node=$NUM_PROC --master_port 29506 main.py \
+torchrun --nproc_per_node=$NUM_PROC --master_port $MASTER_PORT main.py \
   	--model ./modelzoo/llama-3.1-instruct/llama-3.1-8b-instruct \
   	--ddp_size $NUM_DDP_SIZE \
   	--offload \
   	--w_bits 4 --a_bits 4 \
-  	--k_bits 4 --k_asym --k_groupsize 128 \
-  	--v_bits 4 --v_asym --v_groupsize 128 \
   	--cali_bsz 2 --cali_bsz_accumulate_step 4 --epoch $EPOCH --flat_lr 5e-3 \
         --lwc --lac --cali_trans --add_diag $QAT_FLAG \
-        --output_dir ./outputs/ddp_${NUM_DDP_SIZE}_flat${QAT_FILE}_bsz2_accum4_epoch${EPOCH}_nsamples${NSAMPLES} \
-        --quantized_save \
+        --output_dir ./outputs/blk_ddp_${NUM_DDP_SIZE}_flat${QAT_FILE}_bsz2_accum4_epoch${EPOCH}_nsamples${NSAMPLES} \
+        --quantized_save --blockwise_save \
         --cali_dataset redpajama \
         --nsamples $NSAMPLES

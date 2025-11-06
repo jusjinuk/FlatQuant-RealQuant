@@ -6,6 +6,7 @@ import functools
 from contextlib import nullcontext
 from typing import Optional
 
+import json
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -14,6 +15,10 @@ import transformers
 from torch.nn.parallel import DistributedDataParallel as DDP
 from flatquant.function_utils import set_require_grad_all, get_n_set_parameters_byname, get_paras_dict_by_name
 from flatquant.utils import DistEnv
+from flatquant.gptq_utils import rtn_fwrd, _fwrd
+from flatquant.flat_utils import (
+    reparameterize_block, save_quantized_weights_with_safetensors_block, save_misc_weights_with_safetensors_block
+)
 
 def trainable_parameters_num(model, name = None):
     params = []
@@ -54,6 +59,15 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
         torch.cuda.empty_cache()
 
     model.eval()
+
+    if args.blockwise_save:
+        assert args.quantized_save, "blockwise saving requires quantized_save to be enabled"
+        dist.barrier()
+        if dist_env.rank == 0:
+            save_misc_weights_with_safetensors_block(args, model)
+            logger.info("saved misc weights at {}".format(args.exp_dir))
+        dist.barrier()
+
     use_cache = model.config.use_cache
     model.config.use_cache = False
 
@@ -423,13 +437,26 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
             del cur
         
         if rank_zero:
-            print_cpu_memory_usage(f"before to_cpu")
+            print_cpu_memory_usage(f"before saving the block")
             for name, param in module.named_parameters():
                 param.requires_grad = False
                 if name in dtype_dict.keys():
                     param.data = param.to(dtype_dict[name])
-            layers[i] = module.to(device="cpu")
-            print_cpu_memory_usage(f"after to_cpu")
+            if args.blockwise_save:
+                reparameterize_block(module)
+                if args.w_bits < 16:
+                    if not args.learn_scale:
+                        if args.gptq: # GPTQ Weight Quantization
+                            raise NotImplementedError("blockwise saving with GPTQ is not supported yet")
+                        else: # RTN Weight Quantization
+                            quantizers = rtn_fwrd(module, device, args, layer_id=i)
+                    else:
+                        quantizers = _fwrd(module, device, args, layer_id=i)
+                save_quantized_weights_with_safetensors_block(args, module, quantizers, layer_id=i)
+                layers[i] = module.to_empty(device="meta")
+            else:
+                layers[i] = module.to(device="cpu")
+            print_cpu_memory_usage(f"after saving the block")
         else:
             layers[i] = module.to_empty(device="meta")
 
@@ -442,5 +469,22 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
     gc.collect()
     if torch.cuda.is_available() and device.type == 'cuda':
         torch.cuda.empty_cache()
+    dist.barrier()
+    if rank_zero:
+        total_size = 0
+        weight_map = {}
+        for file in os.listdir(args.exp_dir):
+            if file.endswith(".index.json"):
+                with open(os.path.join(args.exp_dir, file), "r") as f:
+                    index = json.load(f)
+                    total_size += index["metadata"]["total_size"]
+                    weight_map.update(index["weight_map"])
+        with open(os.path.join(args.exp_dir, "model.safetensors.index.json"), "w") as f:
+            json.dump({"metadata": {"total_size": total_size}, "weight_map": weight_map}, f, indent=2)
+        
+        for file in os.listdir(args.exp_dir):
+            if file.endswith(".index.json") and file != "model.safetensors.index.json":
+                os.remove(os.path.join(args.exp_dir, file))
+    dist.barrier()
     model.config.use_cache = use_cache
     return model

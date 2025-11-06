@@ -181,6 +181,10 @@ def parser_gen():
     parser.add_argument('--no_apply_trans', action = "store_true", default = False,
                         help = 'Apply kronecker transform matrix')
     
+    # Add block-wise saving flag
+    parser.add_argument('--blockwise_save', action = "store_true", default = False,
+                        help = 'Save the quantized model checkpoint block-wise.')
+
     args = parser.parse_args()
     if args.a_groupsize > -1:
         raise NotImplementedError
