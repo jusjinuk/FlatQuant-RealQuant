@@ -182,13 +182,14 @@ class FlatQuantLlamaAttention(FlatQuantFP16LlamaAttention):
         model_dim = self.config.hidden_size
         head_dim = model_dim // num_heads
 
-        self.register_buffer("trans_matrix_k", torch.randn([head_dim, head_dim], requires_grad = False))
-        self.register_buffer("trans_matrix_k_inv_t", torch.randn([head_dim, head_dim], requires_grad = False))
-        self.register_buffer("trans_matrix_v", torch.randn([head_dim, head_dim], requires_grad = False))
-        self.register_buffer("kclip_factor_a_max", torch.tensor(4.0))
-        self.register_buffer("kclip_factor_a_min", torch.tensor(4.0))
-        self.register_buffer("vclip_factor_a_max", torch.tensor(4.0))
-        self.register_buffer("vclip_factor_a_min", torch.tensor(4.0))
+        if not self.options.fp16_cache:
+            self.register_buffer("trans_matrix_k", torch.randn([head_dim, head_dim], requires_grad = False))
+            self.register_buffer("trans_matrix_k_inv_t", torch.randn([head_dim, head_dim], requires_grad = False))
+            self.register_buffer("trans_matrix_v", torch.randn([head_dim, head_dim], requires_grad = False))
+            self.register_buffer("kclip_factor_a_max", torch.tensor(4.0))
+            self.register_buffer("kclip_factor_a_min", torch.tensor(4.0))
+            self.register_buffer("vclip_factor_a_max", torch.tensor(4.0))
+            self.register_buffer("vclip_factor_a_min", torch.tensor(4.0))
 
 
         left_dim, right_dim = get_decompose_dim(self.config.hidden_size)
@@ -213,15 +214,18 @@ class FlatQuantLlamaAttention(FlatQuantFP16LlamaAttention):
             "cos": kwargs.get("cos"),
             "cache_position": cache_position,
             "attention_mask": attention_mask,
-            "trans_matrix_k": self.trans_matrix_k,
-            "trans_matrix_k_inv_t": self.trans_matrix_k_inv_t,
-            "trans_matrix_v": self.trans_matrix_v,
-            "kclip_factor_a_max": self.kclip_factor_a_max,
-            "kclip_factor_a_min": self.kclip_factor_a_min,
-            "vclip_factor_a_max": self.vclip_factor_a_max,
-            "vclip_factor_a_min": self.vclip_factor_a_min,
             "isFlatQ": self.isFlatQ,
         }
+        if not self.options.fp16_cache:
+            cache_kwargs.update({
+                "trans_matrix_k": self.trans_matrix_k,
+                "trans_matrix_k_inv_t": self.trans_matrix_k_inv_t,
+                "trans_matrix_v": self.trans_matrix_v,
+                "kclip_factor_a_max": self.kclip_factor_a_max,
+                "kclip_factor_a_min": self.kclip_factor_a_min,
+                "vclip_factor_a_max": self.vclip_factor_a_max,
+                "vclip_factor_a_min": self.vclip_factor_a_min,
+            })
 
         return super().forward(
             hidden_states=hidden_states,
@@ -349,13 +353,17 @@ class FlatQuantLlamaForCausalLM(FlatQuantFP16LlamaForCausalLM):
         assert config._attn_implementation == "flash_attention_2"
         if args.fuseLN:
             self.norm = deploy.nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        for layer_idx, layer in enumerate(self.model.layers):
+        from tqdm import tqdm
+        for layer_idx, layer in enumerate(tqdm(self.model.layers, desc="Building layers")):
             layer.self_attn = FlatQuantLlamaAttention(options=args, config=config, layer_idx=layer_idx)
             if args.fuseLN:
                 layer.input_layernorm = deploy.nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
                 layer.post_attention_layernorm = deploy.nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             layer.mlp = FlatQuantLlamaMLP(options=args, config=config)
-        self.cache_dtype = "int4"
+        if args.fp16_cache:
+            self.cache_dtype = "float16"
+        else:
+            self.cache_dtype = "int4"
         if hasattr(self, "generation_config"):
             self.generation_config.cache_implementation = None
 

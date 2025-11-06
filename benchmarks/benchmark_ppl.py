@@ -345,6 +345,7 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', type=str, default="wikitext2", choices=["wikitext2", "c4"], help='Dataset used for perplexity evaluation.')
     parser.add_argument('--eval-fp16', action="store_true", default=False, help='Evaluate the model in FP16.')
     parser.add_argument('--max_length', type=int, default=2048, help='Sequence length for each evaluation chunk.')
-    
+    parser.add_argument('--fp16_cache', action="store_true", default=False, help='Use fp16 cache.')
+
     args = parser.parse_args()
     benchmark(args)

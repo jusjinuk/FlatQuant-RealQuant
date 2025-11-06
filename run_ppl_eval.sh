@@ -30,5 +30,6 @@ for dataset in wikitext2 c4; do
   python3 benchmarks/benchmark_ppl.py \
     --model-config "$MODEL_CONFIG" \
     --checkpoint "$CHECKPOINT_DIR" \
-    --dataset "$dataset"
+    --dataset "$dataset" \
+    --fp16_cache
 done
