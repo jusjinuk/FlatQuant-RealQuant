@@ -5,7 +5,7 @@ import math
 import functools
 from contextlib import nullcontext
 from typing import Optional
-
+from tqdm import tqdm
 import json
 import torch
 import torch.nn as nn
@@ -52,6 +52,7 @@ def print_cpu_memory_usage(message: str):
 def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[DistEnv] = None):
     dist_enabled = dist_env is not None and getattr(dist_env, "world_size", 1) > 1
     device = dist_env.device if dist_enabled else dev
+    rank_zero = (not dist_enabled) or dist_env.rank == 0
 
     if torch.cuda.is_available() and device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -62,11 +63,13 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
 
     if args.blockwise_save:
         assert args.quantized_save, "blockwise saving requires quantized_save to be enabled"
-        dist.barrier()
-        if dist_env.rank == 0:
+        if dist_enabled:
+            dist.barrier()
+        if rank_zero:
             save_misc_weights_with_safetensors_block(args, model)
             logger.info("saved misc weights at {}".format(args.exp_dir))
-        dist.barrier()
+        if dist_enabled:
+            dist.barrier()
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -92,7 +95,18 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
     ddp_size = dist_env.ddp_size if dist_enabled else 1
     dp_rank = dist_env.dp_rank if dist_enabled else 0
     dp_group = dist_env.dp_group if dist_enabled else None
-    rank_zero = (not dist_enabled) or dist_env.rank == 0
+
+    # we tuned learning rate for batch size 4, so we need to scale the learning rate for other batch sizes
+    bsz_scale = args.cali_bsz * args.cali_bsz_accumulate_step / 4.0
+    args.flat_lr = args.flat_lr * bsz_scale
+    args.weight_lr = args.weight_lr * bsz_scale
+    args.scale_lr = args.scale_lr * bsz_scale
+    msg = f"scaled learning rate for batch size {args.cali_bsz * args.cali_bsz_accumulate_step}: flat_lr {args.flat_lr}"
+    if args.learn_weight:
+        msg += f", weight_lr {args.weight_lr}"
+    if args.learn_scale:
+        msg += f", scale_lr {args.scale_lr}"
+    logger.info(msg)
 
     samples_per_rank = total_nsamples if ddp_size == 1 else math.ceil(total_nsamples / ddp_size)
     local_indices = [(idx * ddp_size + dp_rank) % total_nsamples for idx in range(samples_per_rank)]
@@ -221,7 +235,7 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
         module.self_attn._ori_mode = True
         module.mlp._ori_mode = True
         with torch.no_grad():
-            for off in range(0, local_nsamples, args.cali_bsz):
+            for off in tqdm(range(0, local_nsamples, args.cali_bsz), desc=f"Calculating fp_outs for layer {i}"):
                 bs = min(args.cali_bsz, local_nsamples - off)
                 x = fp_inps[off:off+bs]
                 if x.device != device:
@@ -469,7 +483,8 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
     gc.collect()
     if torch.cuda.is_available() and device.type == 'cuda':
         torch.cuda.empty_cache()
-    dist.barrier()
+    if dist_enabled:
+        dist.barrier()
     if rank_zero:
         total_size = 0
         weight_map = {}
@@ -485,6 +500,7 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
         for file in os.listdir(args.exp_dir):
             if file.endswith(".index.json") and file != "model.safetensors.index.json":
                 os.remove(os.path.join(args.exp_dir, file))
-    dist.barrier()
+    if dist_enabled:
+        dist.barrier()
     model.config.use_cache = use_cache
     return model
