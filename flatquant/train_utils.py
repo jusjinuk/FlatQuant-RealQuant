@@ -96,18 +96,6 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
     dp_rank = dist_env.dp_rank if dist_enabled else 0
     dp_group = dist_env.dp_group if dist_enabled else None
 
-    # we tuned learning rate for batch size 4, so we need to scale the learning rate for other batch sizes
-    bsz_scale = args.cali_bsz * args.cali_bsz_accumulate_step / 4.0
-    args.flat_lr = args.flat_lr * bsz_scale
-    args.weight_lr = args.weight_lr * bsz_scale
-    args.scale_lr = args.scale_lr * bsz_scale
-    msg = f"scaled learning rate for batch size {args.cali_bsz * args.cali_bsz_accumulate_step}: flat_lr {args.flat_lr}"
-    if args.learn_weight:
-        msg += f", weight_lr {args.weight_lr}"
-    if args.learn_scale:
-        msg += f", scale_lr {args.scale_lr}"
-    logger.info(msg)
-
     samples_per_rank = total_nsamples if ddp_size == 1 else math.ceil(total_nsamples / ddp_size)
     local_indices = [(idx * ddp_size + dp_rank) % total_nsamples for idx in range(samples_per_rank)]
     local_nsamples = len(local_indices)
