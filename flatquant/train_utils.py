@@ -185,8 +185,8 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
                 layer_time_start = time.time()
             if i > 0:
                 logger.info(
-                    f">>> Expected total time based on layer {i-1} time: {(time.time() - layer_time_start) * num_train_layer:.2f}s " +
-                    f"|| {(time.time() - layer_time_start) * num_train_layer / 3600.0:.2f}h"
+                    f">>> Expected total time based on layer {i-1} time: [Seconds] {(time.time() - layer_time_start) * num_train_layer:.2f} " +
+                    f"|| [Hours] {(time.time() - layer_time_start) * num_train_layer / 3600.0:.2f}"
                 )
                 layer_time_start = time.time()
             if i == 2:
