@@ -51,9 +51,11 @@ torchrun --nproc_per_node=$NUM_PROC --master_port $MASTER_PORT main.py \
   	--ddp_size $NUM_DDP_SIZE \
   	--offload \
   	--w_bits 4 --a_bits 4 \
-  	--cali_bsz 2 --cali_bsz_accumulate_step 4 --epoch $EPOCH --flat_lr 5e-3 \
+  	--cali_bsz 1 --cali_bsz_accumulate_step 8 --epoch $EPOCH --flat_lr 5e-3 \
         --lwc --lac --cali_trans --add_diag $QAT_FLAG \
-        --output_dir ./outputs/blk_ddp_${NUM_DDP_SIZE}_flat${QAT_FILE}_bsz2_accum4_epoch${EPOCH}_nsamples${NSAMPLES} \
+        --output_dir ./outputs/test1_ddp_${NUM_DDP_SIZE}_flat${QAT_FILE}_bsz1_accum8_epoch${EPOCH}_nsamples${NSAMPLES} \
         --quantized_save --blockwise_save \
         --cali_dataset redpajama \
         --nsamples $NSAMPLES
+
+bash run_ppl_eval.sh ./outputs/test1_ddp_${NUM_DDP_SIZE}_flat${QAT_FILE}_bsz1_accum8_epoch${EPOCH}_nsamples${NSAMPLES}/llama-3.1-8b-instruct/w4a4/exp/

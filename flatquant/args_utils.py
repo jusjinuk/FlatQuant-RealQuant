@@ -185,6 +185,9 @@ def parser_gen():
     parser.add_argument('--blockwise_save', action = "store_true", default = False,
                         help = 'Save the quantized model checkpoint block-wise.')
 
+    parser.add_argument('--time_mode', action = "store_true", default = False,
+                        help = 'Time mode for training')
+
     args = parser.parse_args()
     if args.a_groupsize > -1:
         raise NotImplementedError

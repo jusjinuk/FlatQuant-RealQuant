@@ -65,7 +65,7 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
         assert args.quantized_save, "blockwise saving requires quantized_save to be enabled"
         if dist_enabled:
             dist.barrier()
-        if rank_zero:
+        if rank_zero and not args.time_mode:
             save_misc_weights_with_safetensors_block(args, model)
             logger.info("saved misc weights at {}".format(args.exp_dir))
         if dist_enabled:
@@ -179,6 +179,19 @@ def cali_flat_quant(args, model, dataloader, dev, logger, dist_env: Optional[Dis
     num_train_layer = len(layers)
     mse_dict = {}
     for i in range(num_train_layer):
+        if args.time_mode:
+            if i == 0:
+                logger.info(f">>> Timing job Started.")
+                layer_time_start = time.time()
+            if i > 0:
+                logger.info(
+                    f">>> Expected total time based on layer {i-1} time: {(time.time() - layer_time_start) * num_train_layer:.2f}s " +
+                    f"|| {(time.time() - layer_time_start) * num_train_layer / 3600.0:.2f}h"
+                )
+                layer_time_start = time.time()
+            if i == 2:
+                logger.info(f"Timing job Done.")
+                exit()
         if not i == 0 and rank_zero:
             logger.info(f"========= Layer {i} =========")
         layer = layers[i]
